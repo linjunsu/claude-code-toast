@@ -1,12 +1,25 @@
 ﻿<#
 .SYNOPSIS
-    claude-code-toast 一键安装：注册 claudetofocus:// 协议 + 安装 BurntToast。
+    claude-code-toast 一键安装：注册 claudetofocus:// 协议 + 安装 BurntToast + 输出 settings.json 配置。
 .DESCRIPTION
+    支持选择用哪个 PowerShell 跑 hook：
+      -PowerShell 7 ：hook 命令用 pwsh，BurntToast 装到 PowerShell 7（原生，无需额外复制）。
+      -PowerShell 5（默认）：hook 命令用 powershell（Windows PowerShell 5.1，系统自带），
+                          BurntToast 若 PS5.1 看不到会自动复制一份给它。
     把本仓库放到任意目录后运行本脚本即可完成大半配置；
     最后一步把 Stop hook 加进 ~/.claude/settings.json（见 README「AI 一键配置」或本脚本末尾输出）。
-    支持在仓库目录直接运行；脚本里的路径均按实际位置生成。
 #>
+[CmdletBinding()]
+param(
+    [ValidateSet('5', '7')]
+    [string]$PowerShell = '5'
+)
+
 $ErrorActionPreference = 'Stop'
+$usePwsh = ($PowerShell -eq '7')
+$hookCommand = 'powershell'
+if ($usePwsh) { $hookCommand = 'pwsh' }
+
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $vbs = Join-Path $dir 'focus.vbs'
 $toast = Join-Path $dir 'claude-toast.ps1'
@@ -29,22 +42,24 @@ if (-not (Get-Module -ListAvailable BurntToast)) {
     Write-Host "安装 BurntToast（当前 PowerShell）..."
     Install-Module BurntToast -Scope CurrentUser -Force -ErrorAction Continue
 }
-# 确保 Windows PowerShell 5.1 也能用（hook 走 powershell.exe）
-$ps51 = powershell -NoProfile -Command "if (Get-Module -ListAvailable BurntToast) { 'yes' }"
-if ($ps51 -ne 'yes') {
-    $bt = Get-Module -ListAvailable BurntToast | Select-Object -First 1
-    if ($bt) {
-        $src = Split-Path $bt.ModuleBase
-        $dest = "$env:USERPROFILE\Documents\WindowsPowerShell\Modules"
-        New-Item -ItemType Directory -Force $dest | Out-Null
-        Copy-Item -Recurse -Force $src "$dest\BurntToast"
-        Write-Host "已为 Windows PowerShell 5.1 复制 BurntToast"
+if (-not $usePwsh) {
+    # Windows PowerShell 5.1 看不到 pwsh 装的模块 → 复制一份
+    $ps51 = powershell -NoProfile -Command "if (Get-Module -ListAvailable BurntToast) { 'yes' }"
+    if ($ps51 -ne 'yes') {
+        $bt = Get-Module -ListAvailable BurntToast | Select-Object -First 1
+        if ($bt) {
+            $src = Split-Path $bt.ModuleBase
+            $dest = "$env:USERPROFILE\Documents\WindowsPowerShell\Modules"
+            New-Item -ItemType Directory -Force $dest | Out-Null
+            Copy-Item -Recurse -Force $src "$dest\BurntToast"
+            Write-Host "已为 Windows PowerShell 5.1 复制 BurntToast"
+        }
     }
 }
-Write-Host "BurntToast 就绪"
+Write-Host "BurntToast 就绪（hook 将使用: $hookCommand）"
 
 Write-Host "=== [3/3] 配置 ~/.claude/settings.json ==="
-Write-Host "在 settings.json 顶层加以下内容（已有 hooks 就合并 Stop 键，注意路径改为上面的绝对路径）："
+Write-Host "在 settings.json 顶层加以下内容（已有 hooks 就合并 Stop 键，路径改为上面的绝对路径）："
 Write-Host ""
 Write-Host '  "hooks": {'
 Write-Host '    "Stop": ['
@@ -52,7 +67,7 @@ Write-Host '      {'
 Write-Host '        "hooks": ['
 Write-Host '          {'
 Write-Host '            "type": "command",'
-Write-Host '            "command": "powershell",'
+Write-Host "            `"command`": `"$hookCommand`","
 Write-Host "            `"args`": [`"-NoProfile`", `"-ExecutionPolicy`", `"Bypass`", `"-File`", `"$toast`"],"
 Write-Host '            "timeout": 15'
 Write-Host '          }'

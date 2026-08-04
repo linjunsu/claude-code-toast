@@ -16,19 +16,22 @@ Claude Code 每次回应结束，如果你的终端不在前台，右下角会�
 
 把下面这句话发给你的 AI（Claude Code / 其它能在本机跑命令的编程 AI），它会自动完成全部配置：
 
-> 请读取本仓库 README.md 并按「手动安装」章节自动完成 claude-code-toast 配置：运行 setup.ps1 注册 claudetofocus:// 协议并安装 BurntToast，再把 claude-toast.ps1 的绝对路径以 hooks.Stop 形式合并进 ~/.claude/settings.json，配置完成后告诉我。
+> 请读取本仓库 README.md 并按「手动安装」章节自动完成 claude-code-toast 配置：运行 setup.ps1 注册 claudetofocus:// 协议并安装 BurntToast（hook 默认用 Windows PowerShell 5.1，可加 -PowerShell 7 改用 PowerShell 7），再把 claude-toast.ps1 的绝对路径以 hooks.Stop 形式合并进 ~/.claude/settings.json，配置完成后告诉我。
 
 ---
 
 ## 手动安装
 
 1. 把本仓库放到任意目录（例如 `C:\ljs\claude-code-toast`）。
-2. 打开 PowerShell 运行：
+2. 打开 PowerShell 运行（可先看「选择 PowerShell 版本」决定要不要加 `-PowerShell 7`）：
    ```powershell
+   # 默认用 Windows PowerShell 5.1 跑 hook
    powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
+   # 或改用 PowerShell 7（更快、BurntToast 原生安装，无需复制模块）
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -PowerShell 7
    ```
-   脚本会：注册 `claudetofocus://` 协议、安装 BurntToast（含 Windows PowerShell 5.1 副本）、输出 settings.json 配置片段。
-3. 把输出片段合并进 `~/.claude/settings.json`（顶层加 `hooks`；已有 `hooks` 就合并 `Stop` 键，路径换成实际的）：
+   脚本会：注册 `claudetofocus://` 协议、安装 BurntToast、按所选版本输出 settings.json 配置片段。
+3. 把输出片段合并进 `~/.claude/settings.json`（顶层加 `hooks`；已有 `hooks` 就合并 `Stop` 键，路径换成实际的）。`command` 用 `pwsh` 还是 `powershell` 要和上一步的选择一致：
    ```json
    "hooks": {
      "Stop": [
@@ -36,7 +39,7 @@ Claude Code 每次回应结束，如果你的终端不在前台，右下角会�
          "hooks": [
            {
              "type": "command",
-             "command": "powershell",
+             "command": "pwsh",
              "args": [
                "-NoProfile",
                "-ExecutionPolicy",
@@ -51,9 +54,17 @@ Claude Code 每次回应结束，如果你的终端不在前台，右下角会�
      ]
    }
    ```
+   > 用 PowerShell 5.1 的话，把 `"command": "pwsh"` 改成 `"command": "powershell"`。
 4. 重启 Claude Code（或开一次 `/hooks` 重载配置）。
 
-**依赖**：Windows 11、Windows Terminal、PowerShell 5.1+、Claude Code。
+**依赖**：Windows 11、Windows Terminal、PowerShell 5.1 或 7、Claude Code。
+
+## 选择 PowerShell 版本（5 / 7）
+
+| 选项 | hook 命令 | BurntToast | 说明 |
+|---|---|---|---|
+| `-PowerShell 5`（默认） | `powershell` | 装好后若 PS5.1 看不到会自动复制一份 | Windows 系统自带，任何机器都能跑 |
+| `-PowerShell 7` | `pwsh` | 装到 PowerShell 7，原生可用 | 启动更快、默认 UTF-8，需已装 pwsh |
 
 ---
 
