@@ -16,13 +16,13 @@ Claude Code 每次回应结束，如果你的终端不在前台，右下角会�
 
 把下面这句话发给你的 AI（Claude Code / 其它能在本机跑命令的编程 AI），它会自动完成全部配置：
 
-> 请读取本仓库 README.md 并按「手动安装」章节自动完成 claude-code-toast 配置：运行 setup.ps1 注册 claudetofocus:// 协议并安装 BurntToast（hook 默认用 Windows PowerShell 5.1，可加 -PowerShell 7 改用 PowerShell 7），再把 claude-toast.ps1 的绝对路径以 hooks.Stop 形式合并进 ~/.claude/settings.json，配置完成后告诉我。
+> 请先克隆 https://github.com/linjunsu/claude-code-toast 到全局目录 ~/.claude/claude-code-toast（Windows 路径为 C:\Users\<你的用户名>\.claude\claude-code-toast；务必放在全局目录下，不要克隆进当前项目目录），然后读取该仓库 README.md 并按「手动安装」章节自动完成 claude-code-toast 配置：运行 setup.ps1 注册 claudetofocus:// 协议并安装 BurntToast（hook 默认用 Windows PowerShell 5.1，可加 -PowerShell 7 改用 PowerShell 7），再把 claude-toast.ps1 的绝对路径以 hooks.Stop 形式合并进 ~/.claude/settings.json，配置完成后告诉我。
 
 ---
 
 ## 手动安装
 
-1. 把本仓库放到任意目录（例如 `C:\ljs\claude-code-toast`）。
+1. 把本仓库放到全局目录 `~/.claude` 下（例如 `C:\Users\<你的用户名>\.claude\claude-code-toast`）。
 2. 打开 PowerShell 运行（可先看「选择 PowerShell 版本」决定要不要加 `-PowerShell 7`）：
    ```powershell
    # 默认用 Windows PowerShell 5.1 跑 hook
@@ -45,7 +45,7 @@ Claude Code 每次回应结束，如果你的终端不在前台，右下角会�
                "-ExecutionPolicy",
                "Bypass",
                "-File",
-               "C:\\ljs\\claude-code-toast\\claude-toast.ps1"
+               "C:\\Users\\<你的用户名>\\.claude\\claude-code-toast\\claude-toast.ps1"
              ],
              "timeout": 15
            }
