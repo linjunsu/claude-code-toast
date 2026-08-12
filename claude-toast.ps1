@@ -2,7 +2,8 @@
 .SYNOPSIS
     Claude Code hook：任务完成时在右下角弹 Windows 原生 toast，点击「回到终端」按钮回到对应终端。
 .DESCRIPTION
-    由 ~/.claude/settings.json 的 Stop hook 调用（Claude 每次回应结束触发）。
+    由 ~/.claude/settings.json 的 hook 调用：Stop（每次回应结束）与 Notification（Claude 要你做选择）。
+    Notification 的 idle_prompt（闲置提醒）与 Stop 重复，只记日志不弹。
     终端处于前台时不弹，避免打扰；Warp 下再比对窗口标题，只有你正看着本会话那个标签页才静默。
     内容动态：项目名（cwd）+ Claude 最后一条回复（last_assistant_message）；
     拿不到回复时退化为当前任务标题（控制台标题）。
@@ -25,6 +26,7 @@ $logFile = "$env:TEMP\claude-toast-actions.log"
 # 读 hook 输入：stdin 是 UTF-8 字节，用字节流读取避免控制台编码破坏中文
 $projectName = ''
 $lastMsg = ''
+$hookEvent = ''
 try {
     $inStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
@@ -34,7 +36,10 @@ try {
     if ($stdin) {
         $h = $stdin | ConvertFrom-Json
         if ($h.cwd) { $projectName = Split-Path -Leaf $h.cwd }
+        if ($h.'hook_event_name') { $hookEvent = [string]$h.'hook_event_name' }
         if ($h.'last_assistant_message') { $lastMsg = [string]$h.'last_assistant_message' }
+        # Notification 事件的正文在 message 里（如「Claude needs your permission to use Bash」）
+        if ($h.message) { $lastMsg = [string]$h.message }
     }
 } catch { }
 
@@ -178,6 +183,13 @@ function Show-ClaudeToast {
 }
 
 try {
+    # Notification 的 idle_prompt（「Claude is waiting for your input」，闲置约 60 秒触发）
+    # 与本次回应结束时的 Stop 通知内容重复，只记日志不弹；permission_prompt 照弹。
+    if ($hookEvent -eq 'Notification' -and $lastMsg -match 'waiting for your input') {
+        "$(Get-Date -Format o) SKIP_IDLE" | Out-File -Append $logFile
+        exit 0
+    }
+
     # Warp 走自己的会话 URL：Warp 的伪控制台窗口没有 owner，hwnd 路线只能拿到一个不可见窗口，
     # SetForegroundWindow 会「成功」但界面不动。WARP_FOCUS_URL 由 Warp shell 注入并被 hook 继承。
     $warpUri = $env:WARP_FOCUS_URL
@@ -190,7 +202,7 @@ try {
         $sessionTitle = if ($term) { $term.Title } else { '' }
         $fgWindow = Get-ForegroundWindowInfo
         if (-not $Force -and $fgWindow.Process -eq 'warp' -and (Test-SameTitle $fgWindow.Title $sessionTitle)) {
-            "$(Get-Date -Format o) FOCUSED route=warp title=[$sessionTitle]" | Out-File -Append $logFile
+            "$(Get-Date -Format o) FOCUSED event=$hookEvent route=warp title=[$sessionTitle]" | Out-File -Append $logFile
             exit 0
         }
         $launchUri = $warpUri
@@ -227,7 +239,7 @@ try {
     }
 
     Show-ClaudeToast -Title 'Claude Code' -Body $body -LaunchUri $launchUri
-    "$(Get-Date -Format o) FIRED route=$route project=[$projectName] body=[$body]" | Out-File -Append $logFile
+    "$(Get-Date -Format o) FIRED event=$hookEvent route=$route project=[$projectName] body=[$body]" | Out-File -Append $logFile
 } catch {
     "$(Get-Date -Format o) ERROR: $_" | Out-File -Append $logFile
     # 静默失败，不影响 Claude Code 主流程；设 CLAUDE_TOAST_DEBUG=1 时暴露错误便于排查

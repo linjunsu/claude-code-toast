@@ -2,7 +2,7 @@
 
 > Claude Code 任务完成右下角弹窗 + 一键回到对应终端（Windows 11 原生 toast）
 
-Claude Code 每次回应结束，如果你的终端不在前台，右下角会弹出 Windows 原生通知：
+Claude Code **每次回应结束**、以及**需要你做选择时**（批准命令、确认方案），如果你的终端不在前台，右下角会弹出 Windows 原生通知：
 
 - **标题**：Claude Code
 - **正文**：`<项目名> · <Claude 最后一条回复摘要>`（动态，不写死）
@@ -51,6 +51,24 @@ Claude Code 每次回应结束，如果你的终端不在前台，右下角会�
            }
          ]
        }
+     ],
+     "Notification": [
+       {
+         "hooks": [
+           {
+             "type": "command",
+             "command": "pwsh",
+             "args": [
+               "-NoProfile",
+               "-ExecutionPolicy",
+               "Bypass",
+               "-File",
+               "C:\\ljs\\claude-code-toast\\claude-toast.ps1"
+             ],
+             "timeout": 15
+           }
+         ]
+       }
      ]
    }
    ```
@@ -70,8 +88,9 @@ Claude Code 每次回应结束，如果你的终端不在前台，右下角会�
 
 ## 行为
 
-- **触发**：`Stop` hook（Claude 每次回应结束）
-- **内容优先级**：Claude 最后回复摘要 > 当前任务标题（控制台标题）> 项目名 > 兜底文案
+- **触发**：`Stop`（每次回应结束）+ `Notification`（Claude 要你做选择，如批准命令）
+- **内容优先级**：`Notification` 用事件自带的 `message`；`Stop` 用 Claude 最后回复摘要 > 当前任务标题（控制台标题）> 项目名 > 兜底文案
+- **不重复打扰**：`Notification` 的 `idle_prompt`（闲置约 60 秒的「等你输入」提醒）与 `Stop` 那条内容重复，只记日志不弹
 - **前台判断**：终端窗口在前台时不弹。Warp 下改为比对标题——Warp 窗口标题实时跟随当前标签页，与本会话控制台标题一致才静默，所以**别的标签页跑完照样弹**
 - **回终端分两条路线**：
   - **Warp**：读 Warp 注入的 `WARP_FOCUS_URL`（`warp://session/<uuid>`），toast 直接用它做协议激活，由 Warp 自己切窗口 + 切标签页，不走寻窗和 `focus.ps1`
