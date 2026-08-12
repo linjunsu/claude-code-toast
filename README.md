@@ -5,7 +5,7 @@
 Claude Code **每次回应结束**、以及**需要你做选择时**（批准命令、确认方案），如果你的终端不在前台，右下角会弹出 Windows 原生通知：
 
 - **标题**：Claude Code
-- **正文**：`<项目名> · <Claude 最后一条回复摘要>`；要你做选择时是 `<项目名> · <Claude 请求的权限>`（动态，不写死）
+- **正文**：`<项目名> · <Claude 最后一条回复摘要>`；要你做选择时是 `<项目名> · 需要授权：<工具> — <做什么>`，例如 `workbench · 需要授权：PowerShell — 重启开发服务器`
 - **按钮**：「回到终端」——点击精确切回承载该会话的终端窗口（多窗口多会话不混淆）；Warp 下还能切回该会话所在的标签页
 
 行为复刻 GitHub Codex：**窗口不在这页才弹**；终端在前台时不打扰。
@@ -89,7 +89,8 @@ Claude Code **每次回应结束**、以及**需要你做选择时**（批准命
 ## 行为
 
 - **触发**：`Stop`（每次回应结束）+ `Notification`（Claude 要你做选择，如批准命令）
-- **内容优先级**：`Notification` 用事件自带的 `message`；`Stop` 用 Claude 最后回复摘要 > 当前任务标题（控制台标题）> 项目名 > 兜底文案
+- **内容优先级**：`Notification` 用待批工具（从 transcript 取）> 事件自带的 `message`；`Stop` 用 Claude 最后回复摘要 > 当前任务标题（控制台标题）> 项目名 > 兜底文案
+- **权限通知为什么要读 transcript**：`Notification` 的 `message` 恒为 `Claude needs your permission` 这一句死文案，不含工具名，光看通知没法判断该不该批。改为顺着 hook 给的 `transcript_path` 取会话记录尾部，最后一个还没有对应 `tool_result` 的 `tool_use` 就是卡在权限确认上的那个；`Bash`/`PowerShell` 取它的 `description`（拿不到退回命令首行），`Edit`/`Write`/`Read` 取文件名，`Grep`/`Glob` 取搜索模式，`WebFetch` 取 URL
 - **不重复打扰**：`Notification` 的 `idle_prompt`（闲置约 60 秒的「等你输入」提醒）与 `Stop` 那条内容重复，只记日志不弹
 - **前台判断**：终端窗口在前台时不弹。Warp 下改为比对标题——Warp 窗口标题实时跟随当前标签页，与本会话控制台标题一致才静默，所以**别的标签页跑完照样弹**
 - **回终端分两条路线**（按环境变量自动选，两边都不用配置）：
