@@ -3,7 +3,7 @@
     Claude Code hook：任务完成时在右下角弹 Windows 原生 toast，点击「回到终端」按钮回到对应终端。
 .DESCRIPTION
     由 ~/.claude/settings.json 的 Stop hook 调用（Claude 每次回应结束触发）。
-    终端处于前台时不弹，避免打扰。
+    终端处于前台时不弹，避免打扰；Warp 下再比对窗口标题，只有你正看着本会话那个标签页才静默。
     内容动态：项目名（cwd）+ Claude 最后一条回复（last_assistant_message）；
     拿不到回复时退化为当前任务标题（控制台标题）。
     回终端分两条路线：
@@ -38,13 +38,28 @@ try {
     }
 } catch { }
 
-# 清洗标题：去加载动画字符、压缩空白、截断
-function Clean-TaskTitle {
+# 标题归一化：去开头的加载动画字符、压缩空白
+function Get-TitleKey {
     param([string]$Raw)
     if (-not $Raw) { return '' }
     $t = $Raw -replace '^[^A-Za-z0-9一-鿿]+', ''
     $t = $t -replace '\s+', ' '
-    $t = $t.Trim()
+    return $t.Trim()
+}
+
+# 两个标题是否指向同一个会话：动画字符逐秒变化故先归一化，任一侧被截断也算命中
+function Test-SameTitle {
+    param([string]$A, [string]$B)
+    $ka = Get-TitleKey -Raw $A
+    $kb = Get-TitleKey -Raw $B
+    if (-not $ka -or -not $kb) { return $false }
+    return ($ka.StartsWith($kb) -or $kb.StartsWith($ka))
+}
+
+# 清洗标题：归一化后截断
+function Clean-TaskTitle {
+    param([string]$Raw)
+    $t = Get-TitleKey -Raw $Raw
     if ($t.Length -gt 60) { $t = $t.Substring(0, 60) + '…' }
     return $t
 }
@@ -72,18 +87,25 @@ function Initialize-Win32 {
         [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, int uCmd);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int procId);
+        [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int size);
 '@ -ErrorAction SilentlyContinue
 }
 
-# 前台窗口所属进程名（Warp 路线下用它判断是否该静默）
-function Get-ForegroundProcessName {
+# 前台窗口的进程名与标题（Warp 路线下用它判断是否该静默）
+function Get-ForegroundWindowInfo {
     Initialize-Win32
+    $result = @{ Process = ''; Title = '' }
     $fg = [CliToast.Win32]::GetForegroundWindow()
-    if ($fg -eq [IntPtr]::Zero) { return '' }
+    if ($fg -eq [IntPtr]::Zero) { return $result }
     $procId = 0
     [CliToast.Win32]::GetWindowThreadProcessId($fg, [ref]$procId) | Out-Null
-    if ($procId -eq 0) { return '' }
-    try { return (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { return '' }
+    if ($procId -ne 0) {
+        try { $result.Process = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { }
+    }
+    $sb = New-Object System.Text.StringBuilder 1024
+    [CliToast.Win32]::GetWindowText($fg, $sb, 1024) | Out-Null
+    $result.Title = $sb.ToString()
+    return $result
 }
 
 # 找到承载本会话的终端窗口 + 读当前任务标题（控制台标题）
@@ -161,13 +183,18 @@ try {
     $warpUri = $env:WARP_FOCUS_URL
 
     if ($warpUri) {
-        # Warp 在前台 → 不弹（会话与标签页的对应关系拿不到，按窗口进程粒度判断）
-        if (-not $Force -and (Get-ForegroundProcessName) -eq 'warp') {
-            "$(Get-Date -Format o) FOCUSED route=warp" | Out-File -Append $logFile
+        # Warp 窗口标题实时跟随当前标签页，与本会话控制台标题一致即说明你正看着这个标签页 → 不弹。
+        # （warp.sqlite 的 active_tab_index 只在特定时刻落盘，切标签页不写，不能用）
+        # 拿不到本会话标题时按「不在当前标签页」处理：宁可多弹一次，也不吞掉通知。
+        $term = Get-TerminalInfo
+        $sessionTitle = if ($term) { $term.Title } else { '' }
+        $fgWindow = Get-ForegroundWindowInfo
+        if (-not $Force -and $fgWindow.Process -eq 'warp' -and (Test-SameTitle $fgWindow.Title $sessionTitle)) {
+            "$(Get-Date -Format o) FOCUSED route=warp title=[$sessionTitle]" | Out-File -Append $logFile
             exit 0
         }
         $launchUri = $warpUri
-        $taskTitle = ''
+        $taskTitle = Clean-TaskTitle -Raw $sessionTitle
         $route = 'warp'
     } else {
         $info = Get-TerminalInfo

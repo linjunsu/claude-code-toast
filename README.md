@@ -72,7 +72,7 @@ Claude Code 每次回应结束，如果你的终端不在前台，右下角会�
 
 - **触发**：`Stop` hook（Claude 每次回应结束）
 - **内容优先级**：Claude 最后回复摘要 > 当前任务标题（控制台标题）> 项目名 > 兜底文案
-- **前台判断**：终端窗口在前台时不弹（Warp 下按窗口进程判断，Warp 在前台就不弹）
+- **前台判断**：终端窗口在前台时不弹。Warp 下改为比对标题——Warp 窗口标题实时跟随当前标签页，与本会话控制台标题一致才静默，所以**别的标签页跑完照样弹**
 - **回终端分两条路线**：
   - **Warp**：读 Warp 注入的 `WARP_FOCUS_URL`（`warp://session/<uuid>`），toast 直接用它做协议激活，由 Warp 自己切窗口 + 切标签页，不走寻窗和 `focus.ps1`
   - **Windows Terminal 等**：`FreeConsole` + 逐祖先 `AttachConsole` 精确寻窗（控制台窗口的 owner = 承载该会话的终端窗口，多窗口单进程也精确），toast 走 `claudetofocus://` 协议 → `focus.ps1` 用 `AttachThreadInput` 绕过 Windows 前台锁
@@ -93,7 +93,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
 - **toast 内容为空 / 只显示「新通知」**：本机实测手写 WinRT toast XML（`LoadXml` + `encoding` 声明）会渲染成空横幅，必须用 BurntToast 模块。
 - **hook 找不到终端窗口**：Claude Code 在 Windows 上以隐藏控制台（`CREATE_NO_WINDOW`）派生 hook，`GetConsoleWindow()=0` 且 `AttachConsole` 直接失败；需先 `FreeConsole()` 再逐祖先 `AttachConsole`。
 - **点了按钮终端不回来**：从 toast 协议激活启动的进程没有「前台权」，`SetForegroundWindow` 会静默失败；用 `AttachThreadInput` 绕过。
-- **Warp 下点了没反应**：Warp 的 `PseudoConsoleWindow` 不挂 owner（Windows Terminal 会挂），寻窗只能拿到那个不可见窗口，`SetForegroundWindow` 返回 True 但界面不动。所以 Warp 走 `WARP_FOCUS_URL` 而不是 hwnd。不需要额外装 Warp 自己的 Claude Code hook，装了会变成两条通知。
+- **Warp 下点了没反应**：Warp 的 `PseudoConsoleWindow` 不挂 owner（Windows Terminal 会挂），寻窗只能拿到那个不可见窗口，`SetForegroundWindow` 返回 True 但界面不动。所以 Warp 走 `WARP_FOCUS_URL` 而不是 hwnd。
+- **Warp 下怎么判断「你在看哪个标签页」**：`warp.sqlite` 里的 `windows.active_tab_index` 切标签页时**不落盘**（实测切换一分钟内数据库零写入），不可用；可用的是 Warp 窗口标题，它实时跟随当前标签页。局限：两个标签页的会话标题恰好相同时会误判为同一个而静默。
+- **不要同时装 Warp 官方的 [claude-code-warp](https://github.com/warpdotdev/claude-code-warp) 插件**，那套走 OSC 777 让 Warp 自己弹通知，和本项目重复，会收到两条。
 - **没弹窗排查**：看 `%TEMP%\claude-toast-actions.log`（记录 `NO_TERMINAL` / `FOCUSED` / `FIRED` / `ERROR`，`route=warp` / `route=hwnd` 标明走的哪条路线）。
 
 ---
