@@ -6,11 +6,13 @@
     终端处于前台时不弹，避免打扰。
     内容动态：项目名（cwd）+ Claude 最后一条回复（last_assistant_message）；
     拿不到回复时退化为当前任务标题（控制台标题）。
-    精确找到承载本会话的终端窗口：hook 进程自带隐藏控制台 → 先 FreeConsole，
-    再向上逐个祖先 AttachConsole，首个成功者即本会话 shell，其控制台窗口的 owner
-    就是承载本会话的 Windows Terminal 真实窗口（多窗口单进程下也精确）。
+    回终端分两条路线：
+      · Warp：用 Warp 注入的 WARP_FOCUS_URL（warp://session/<uuid>）直接激活，精确到标签页。
+      · 其它终端（Windows Terminal 等）：hook 进程自带隐藏控制台 → 先 FreeConsole，
+        再向上逐个祖先 AttachConsole，首个成功者即本会话 shell，其控制台窗口的 owner
+        就是承载本会话的终端真实窗口（多窗口单进程下也精确）。
     toast 用 BurntToast 显示（手写 WinRT XML 在本机渲染为空，故弃用），
-    「回到终端」按钮用协议激活 → claudetofocus:// 协议 → focus.ps1 聚焦该窗口。
+    「回到终端」按钮用协议激活跳转到上述 URI。
     -Force：测试用，无视前台判断直接弹。
     每次触发写入 %TEMP%\claude-toast-actions.log 便于排查。
 #>
@@ -60,8 +62,8 @@ function Clean-Message {
     return $t
 }
 
-# 找到承载本会话的终端窗口 + 读当前任务标题（控制台标题）
-function Get-TerminalInfo {
+# Win32 声明：寻窗与前台判断共用
+function Initialize-Win32 {
     Add-Type -Namespace CliToast -Name Win32 -MemberDefinition @'
         [DllImport("kernel32.dll")] public static extern bool AttachConsole(int dwProcessId);
         [DllImport("kernel32.dll")] public static extern bool FreeConsole();
@@ -69,7 +71,24 @@ function Get-TerminalInfo {
         [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern bool GetConsoleTitle(System.Text.StringBuilder text, int size);
         [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, int uCmd);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int procId);
 '@ -ErrorAction SilentlyContinue
+}
+
+# 前台窗口所属进程名（Warp 路线下用它判断是否该静默）
+function Get-ForegroundProcessName {
+    Initialize-Win32
+    $fg = [CliToast.Win32]::GetForegroundWindow()
+    if ($fg -eq [IntPtr]::Zero) { return '' }
+    $procId = 0
+    [CliToast.Win32]::GetWindowThreadProcessId($fg, [ref]$procId) | Out-Null
+    if ($procId -eq 0) { return '' }
+    try { return (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { return '' }
+}
+
+# 找到承载本会话的终端窗口 + 读当前任务标题（控制台标题）
+function Get-TerminalInfo {
+    Initialize-Win32
 
     # 本进程可能自带隐藏控制台（Claude Code 用 CREATE_NO_WINDOW 派生 hook），
     # 有控制台时 AttachConsole 必然失败 → 先释放
@@ -111,14 +130,14 @@ function Get-TerminalInfo {
     return $null
 }
 
-# 弹 toast：BurntToast 显示 + 「回到终端」按钮走协议激活聚焦窗口
+# 弹 toast：BurntToast 显示 + 「回到终端」按钮走协议激活回到终端
 function Show-ClaudeToast {
-    param([string]$Title, [string]$Body, [string]$TargetHwnd)
+    param([string]$Title, [string]$Body, [string]$LaunchUri)
 
     Import-Module BurntToast -ErrorAction Stop
 
-    # toast 本体 + 「回到终端」按钮都走 claudetofocus:// 协议激活，点任何一处都回终端
-    $uri = "claudetofocus://focus?hwnd=$TargetHwnd"
+    # toast 本体 + 「回到终端」按钮都走同一个协议 URI，点任何一处都回终端
+    $uri = $LaunchUri
     $text1 = New-BTText -Text $Title
     $text2 = New-BTText -Text $Body
 
@@ -137,22 +156,39 @@ function Show-ClaudeToast {
 }
 
 try {
-    $info = Get-TerminalInfo
-    if (-not $info -or $info.Hwnd -eq [IntPtr]::Zero) {
-        "$(Get-Date -Format o) NO_TERMINAL" | Out-File -Append $logFile
-        exit 0
-    }
+    # Warp 走自己的会话 URL：Warp 的伪控制台窗口没有 owner，hwnd 路线只能拿到一个不可见窗口，
+    # SetForegroundWindow 会「成功」但界面不动。WARP_FOCUS_URL 由 Warp shell 注入并被 hook 继承。
+    $warpUri = $env:WARP_FOCUS_URL
 
-    # 终端在前台 → 不弹
-    $fg = [CliToast.Win32]::GetForegroundWindow()
-    if (-not $Force -and $fg -eq $info.Hwnd) {
-        "$(Get-Date -Format o) FOCUSED case=$($info.Case) target=$($info.Hwnd)" | Out-File -Append $logFile
-        exit 0
+    if ($warpUri) {
+        # Warp 在前台 → 不弹（会话与标签页的对应关系拿不到，按窗口进程粒度判断）
+        if (-not $Force -and (Get-ForegroundProcessName) -eq 'warp') {
+            "$(Get-Date -Format o) FOCUSED route=warp" | Out-File -Append $logFile
+            exit 0
+        }
+        $launchUri = $warpUri
+        $taskTitle = ''
+        $route = 'warp'
+    } else {
+        $info = Get-TerminalInfo
+        if (-not $info -or $info.Hwnd -eq [IntPtr]::Zero) {
+            "$(Get-Date -Format o) NO_TERMINAL" | Out-File -Append $logFile
+            exit 0
+        }
+
+        # 终端在前台 → 不弹
+        $fg = [CliToast.Win32]::GetForegroundWindow()
+        if (-not $Force -and $fg -eq $info.Hwnd) {
+            "$(Get-Date -Format o) FOCUSED case=$($info.Case) target=$($info.Hwnd)" | Out-File -Append $logFile
+            exit 0
+        }
+        $launchUri = "claudetofocus://focus?hwnd=$($info.Hwnd)"
+        $taskTitle = Clean-TaskTitle -Raw $info.Title
+        $route = "hwnd case=$($info.Case) target=$($info.Hwnd)"
     }
 
     # 内容优先级：Claude 最后回复 > 任务标题 > 项目名 > 兜底
     $msg = Clean-Message -Raw $lastMsg
-    $taskTitle = Clean-TaskTitle -Raw $info.Title
     if ($msg) {
         $body = if ($projectName) { "$projectName · $msg" } else { $msg }
     } elseif ($taskTitle) {
@@ -163,8 +199,8 @@ try {
         $body = '任务完成'
     }
 
-    Show-ClaudeToast -Title 'Claude Code' -Body $body -TargetHwnd $info.Hwnd
-    "$(Get-Date -Format o) FIRED case=$($info.Case) target=$($info.Hwnd) project=[$projectName] body=[$body]" | Out-File -Append $logFile
+    Show-ClaudeToast -Title 'Claude Code' -Body $body -LaunchUri $launchUri
+    "$(Get-Date -Format o) FIRED route=$route project=[$projectName] body=[$body]" | Out-File -Append $logFile
 } catch {
     "$(Get-Date -Format o) ERROR: $_" | Out-File -Append $logFile
     # 静默失败，不影响 Claude Code 主流程；设 CLAUDE_TOAST_DEBUG=1 时暴露错误便于排查
