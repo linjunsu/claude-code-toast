@@ -27,6 +27,7 @@ $logFile = "$env:TEMP\claude-toast-actions.log"
 $projectName = ''
 $lastMsg = ''
 $hookEvent = ''
+$transcriptPath = ''
 try {
     $inStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
@@ -38,7 +39,9 @@ try {
         if ($h.cwd) { $projectName = Split-Path -Leaf $h.cwd }
         if ($h.'hook_event_name') { $hookEvent = [string]$h.'hook_event_name' }
         if ($h.'last_assistant_message') { $lastMsg = [string]$h.'last_assistant_message' }
-        # Notification 事件的正文在 message 里（如「Claude needs your permission to use Bash」）
+        if ($h.'transcript_path') { $transcriptPath = [string]$h.'transcript_path' }
+        # Notification 的正文永远是「Claude needs your permission」这一句死文案，
+        # 不含工具名，光看通知无法判断该不该批 → 待批工具从 transcript 里补。
         if ($h.message) { $lastMsg = [string]$h.message }
     }
 } catch { }
@@ -80,6 +83,54 @@ function Clean-Message {
     $t = $t.Trim()
     if ($t.Length -gt 80) { $t = $t.Substring(0, 80) + '…' }
     return $t
+}
+
+# 从 transcript 里取出正在等你批准的那个工具调用。
+# Notification 的 message 恒为「Claude needs your permission」，不带工具名；
+# transcript 的最后一个 tool_use 若还没有对应的 tool_result，就是卡在权限确认上的那个。
+function Get-PendingTool {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path $Path)) { return $null }
+
+    # transcript 可达数 MB，只读尾部若干行
+    $tail = Get-Content $Path -Tail 250 -ErrorAction SilentlyContinue
+    if (-not $tail) { return $null }
+
+    $lastUse = $null
+    $resultIds = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($line in $tail) {
+        try { $o = $line | ConvertFrom-Json } catch { continue }
+        if (-not $o.message.content) { continue }
+        foreach ($c in $o.message.content) {
+            if ($c.type -eq 'tool_use')    { $lastUse = $c }
+            elseif ($c.type -eq 'tool_result' -and $c.tool_use_id) { [void]$resultIds.Add([string]$c.tool_use_id) }
+        }
+    }
+    if (-not $lastUse) { return $null }
+    # 已经有结果 = 早就执行完了，不是本次要批的
+    if ($lastUse.id -and $resultIds.Contains([string]$lastUse.id)) { return $null }
+
+    $name = [string]$lastUse.name
+    $in = $lastUse.input
+    $detail = ''
+    switch -Regex ($name) {
+        '^(Bash|PowerShell)$' {
+            # description 是给人看的一句话摘要，比原始命令好读；没有再退回命令首行
+            if ($in.description) { $detail = [string]$in.description }
+            elseif ($in.command) { $detail = ([string]$in.command -split "`n")[0] }
+        }
+        '^(Edit|Write|Read|NotebookEdit)$' {
+            if ($in.file_path) { $detail = Split-Path -Leaf ([string]$in.file_path) }
+        }
+        '^(Glob|Grep)$'  { if ($in.pattern) { $detail = [string]$in.pattern } }
+        '^WebFetch$'     { if ($in.url)     { $detail = [string]$in.url } }
+        '^(Task|Agent)$' { if ($in.description) { $detail = [string]$in.description } }
+        default {
+            if ($in.description) { $detail = [string]$in.description }
+            elseif ($in.command) { $detail = ([string]$in.command -split "`n")[0] }
+        }
+    }
+    return @{ Name = $name; Detail = $detail }
 }
 
 # Win32 声明：寻窗与前台判断共用
@@ -226,8 +277,19 @@ try {
         $route = "hwnd case=$($info.Case) target=$($info.Hwnd)"
     }
 
-    # 内容优先级：Claude 最后回复 > 任务标题 > 项目名 > 兜底
-    $msg = Clean-Message -Raw $lastMsg
+    # 权限请求：把死文案换成「需要授权：<工具> — <做什么>」，通知里就能判断该不该批
+    $msg = ''
+    if ($hookEvent -eq 'Notification' -and $lastMsg -match 'permission') {
+        $pending = Get-PendingTool -Path $transcriptPath
+        if ($pending) {
+            $msg = if ($pending.Detail) { "需要授权：$($pending.Name) — $($pending.Detail)" }
+                   else                 { "需要授权：$($pending.Name)" }
+            $msg = Clean-Message -Raw $msg
+        }
+    }
+
+    # 内容优先级：待批工具 > Claude 最后回复 > 任务标题 > 项目名 > 兜底
+    if (-not $msg) { $msg = Clean-Message -Raw $lastMsg }
     if ($msg) {
         $body = if ($projectName) { "$projectName · $msg" } else { $msg }
     } elseif ($taskTitle) {
