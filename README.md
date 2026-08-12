@@ -16,7 +16,7 @@ Claude Code **每次回应结束**、以及**需要你做选择时**（批准命
 
 把下面这句话发给你的 AI（Claude Code / 其它能在本机跑命令的编程 AI），它会自动完成全部配置：
 
-> 请读取本仓库 README.md 并按「手动安装」章节自动完成 claude-code-toast 配置：运行 setup.ps1 注册 claudetofocus:// 协议并安装 BurntToast（hook 默认用 Windows PowerShell 5.1，可加 -PowerShell 7 改用 PowerShell 7），再把 claude-toast.ps1 的绝对路径以 hooks.Stop 形式合并进 ~/.claude/settings.json，配置完成后告诉我。
+> 请读取本仓库 README.md 并按「手动安装」章节自动完成 claude-code-toast 配置：运行 setup.ps1 注册 claudetofocus:// 协议并安装 BurntToast（hook 默认用 Windows PowerShell 5.1，可加 -PowerShell 7 改用 PowerShell 7），再把 claude-toast.ps1 的绝对路径同时以 hooks.Stop 和 hooks.Notification 两个键合并进 ~/.claude/settings.json，配置完成后告诉我。
 
 ---
 
@@ -92,7 +92,7 @@ Claude Code **每次回应结束**、以及**需要你做选择时**（批准命
 - **内容优先级**：`Notification` 用事件自带的 `message`；`Stop` 用 Claude 最后回复摘要 > 当前任务标题（控制台标题）> 项目名 > 兜底文案
 - **不重复打扰**：`Notification` 的 `idle_prompt`（闲置约 60 秒的「等你输入」提醒）与 `Stop` 那条内容重复，只记日志不弹
 - **前台判断**：终端窗口在前台时不弹。Warp 下改为比对标题——Warp 窗口标题实时跟随当前标签页，与本会话控制台标题一致才静默，所以**别的标签页跑完照样弹**
-- **回终端分两条路线**：
+- **回终端分两条路线**（按环境变量自动选，两边都不用配置）：
   - **Warp**：读 Warp 注入的 `WARP_FOCUS_URL`（`warp://session/<uuid>`），toast 直接用它做协议激活，由 Warp 自己切窗口 + 切标签页，不走寻窗和 `focus.ps1`
   - **Windows Terminal 等**：`FreeConsole` + 逐祖先 `AttachConsole` 精确寻窗（控制台窗口的 owner = 承载该会话的终端窗口，多窗口单进程也精确），toast 走 `claudetofocus://` 协议 → `focus.ps1` 用 `AttachThreadInput` 绕过 Windows 前台锁
 
