@@ -2,15 +2,18 @@
 .SYNOPSIS
     Claude Code hook：任务完成时在右下角弹 Windows 原生 toast，点击「回到终端」按钮回到对应终端。
 .DESCRIPTION
-    由 ~/.claude/settings.json 的 Stop hook 调用（Claude 每次回应结束触发）。
-    终端处于前台时不弹，避免打扰。
+    由 ~/.claude/settings.json 的 hook 调用：Stop（每次回应结束）与 Notification（Claude 要你做选择）。
+    Notification 的 idle_prompt（闲置提醒）与 Stop 重复，只记日志不弹。
+    终端处于前台时不弹，避免打扰；Warp 下再比对窗口标题，只有你正看着本会话那个标签页才静默。
     内容动态：项目名（cwd）+ Claude 最后一条回复（last_assistant_message）；
     拿不到回复时退化为当前任务标题（控制台标题）。
-    精确找到承载本会话的终端窗口：hook 进程自带隐藏控制台 → 先 FreeConsole，
-    再向上逐个祖先 AttachConsole，首个成功者即本会话 shell，其控制台窗口的 owner
-    就是承载本会话的 Windows Terminal 真实窗口（多窗口单进程下也精确）。
+    回终端分两条路线：
+      · Warp：用 Warp 注入的 WARP_FOCUS_URL（warp://session/<uuid>）直接激活，精确到标签页。
+      · 其它终端（Windows Terminal 等）：hook 进程自带隐藏控制台 → 先 FreeConsole，
+        再向上逐个祖先 AttachConsole，首个成功者即本会话 shell，其控制台窗口的 owner
+        就是承载本会话的终端真实窗口（多窗口单进程下也精确）。
     toast 用 BurntToast 显示（手写 WinRT XML 在本机渲染为空，故弃用），
-    「回到终端」按钮用协议激活 → claudetofocus:// 协议 → focus.ps1 聚焦该窗口。
+    「回到终端」按钮用协议激活跳转到上述 URI。
     -Force：测试用，无视前台判断直接弹。
     每次触发写入 %TEMP%\claude-toast-actions.log 便于排查。
 #>
@@ -23,6 +26,7 @@ $logFile = "$env:TEMP\claude-toast-actions.log"
 # 读 hook 输入：stdin 是 UTF-8 字节，用字节流读取避免控制台编码破坏中文
 $projectName = ''
 $lastMsg = ''
+$hookEvent = ''
 try {
     $inStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
@@ -32,17 +36,35 @@ try {
     if ($stdin) {
         $h = $stdin | ConvertFrom-Json
         if ($h.cwd) { $projectName = Split-Path -Leaf $h.cwd }
+        if ($h.'hook_event_name') { $hookEvent = [string]$h.'hook_event_name' }
         if ($h.'last_assistant_message') { $lastMsg = [string]$h.'last_assistant_message' }
+        # Notification 事件的正文在 message 里（如「Claude needs your permission to use Bash」）
+        if ($h.message) { $lastMsg = [string]$h.message }
     }
 } catch { }
 
-# 清洗标题：去加载动画字符、压缩空白、截断
-function Clean-TaskTitle {
+# 标题归一化：去开头的加载动画字符、压缩空白
+function Get-TitleKey {
     param([string]$Raw)
     if (-not $Raw) { return '' }
     $t = $Raw -replace '^[^A-Za-z0-9一-鿿]+', ''
     $t = $t -replace '\s+', ' '
-    $t = $t.Trim()
+    return $t.Trim()
+}
+
+# 两个标题是否指向同一个会话：动画字符逐秒变化故先归一化，任一侧被截断也算命中
+function Test-SameTitle {
+    param([string]$A, [string]$B)
+    $ka = Get-TitleKey -Raw $A
+    $kb = Get-TitleKey -Raw $B
+    if (-not $ka -or -not $kb) { return $false }
+    return ($ka.StartsWith($kb) -or $kb.StartsWith($ka))
+}
+
+# 清洗标题：归一化后截断
+function Clean-TaskTitle {
+    param([string]$Raw)
+    $t = Get-TitleKey -Raw $Raw
     if ($t.Length -gt 60) { $t = $t.Substring(0, 60) + '…' }
     return $t
 }
@@ -60,8 +82,8 @@ function Clean-Message {
     return $t
 }
 
-# 找到承载本会话的终端窗口 + 读当前任务标题（控制台标题）
-function Get-TerminalInfo {
+# Win32 声明：寻窗与前台判断共用
+function Initialize-Win32 {
     Add-Type -Namespace CliToast -Name Win32 -MemberDefinition @'
         [DllImport("kernel32.dll")] public static extern bool AttachConsole(int dwProcessId);
         [DllImport("kernel32.dll")] public static extern bool FreeConsole();
@@ -69,7 +91,31 @@ function Get-TerminalInfo {
         [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern bool GetConsoleTitle(System.Text.StringBuilder text, int size);
         [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, int uCmd);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int procId);
+        [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int size);
 '@ -ErrorAction SilentlyContinue
+}
+
+# 前台窗口的进程名与标题（Warp 路线下用它判断是否该静默）
+function Get-ForegroundWindowInfo {
+    Initialize-Win32
+    $result = @{ Process = ''; Title = '' }
+    $fg = [CliToast.Win32]::GetForegroundWindow()
+    if ($fg -eq [IntPtr]::Zero) { return $result }
+    $procId = 0
+    [CliToast.Win32]::GetWindowThreadProcessId($fg, [ref]$procId) | Out-Null
+    if ($procId -ne 0) {
+        try { $result.Process = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { }
+    }
+    $sb = New-Object System.Text.StringBuilder 1024
+    [CliToast.Win32]::GetWindowText($fg, $sb, 1024) | Out-Null
+    $result.Title = $sb.ToString()
+    return $result
+}
+
+# 找到承载本会话的终端窗口 + 读当前任务标题（控制台标题）
+function Get-TerminalInfo {
+    Initialize-Win32
 
     # 本进程可能自带隐藏控制台（Claude Code 用 CREATE_NO_WINDOW 派生 hook），
     # 有控制台时 AttachConsole 必然失败 → 先释放
@@ -111,14 +157,14 @@ function Get-TerminalInfo {
     return $null
 }
 
-# 弹 toast：BurntToast 显示 + 「回到终端」按钮走协议激活聚焦窗口
+# 弹 toast：BurntToast 显示 + 「回到终端」按钮走协议激活回到终端
 function Show-ClaudeToast {
-    param([string]$Title, [string]$Body, [string]$TargetHwnd)
+    param([string]$Title, [string]$Body, [string]$LaunchUri)
 
     Import-Module BurntToast -ErrorAction Stop
 
-    # toast 本体 + 「回到终端」按钮都走 claudetofocus:// 协议激活，点任何一处都回终端
-    $uri = "claudetofocus://focus?hwnd=$TargetHwnd"
+    # toast 本体 + 「回到终端」按钮都走同一个协议 URI，点任何一处都回终端
+    $uri = $LaunchUri
     $text1 = New-BTText -Text $Title
     $text2 = New-BTText -Text $Body
 
@@ -137,22 +183,51 @@ function Show-ClaudeToast {
 }
 
 try {
-    $info = Get-TerminalInfo
-    if (-not $info -or $info.Hwnd -eq [IntPtr]::Zero) {
-        "$(Get-Date -Format o) NO_TERMINAL" | Out-File -Append $logFile
+    # Notification 的 idle_prompt（「Claude is waiting for your input」，闲置约 60 秒触发）
+    # 与本次回应结束时的 Stop 通知内容重复，只记日志不弹；permission_prompt 照弹。
+    if ($hookEvent -eq 'Notification' -and $lastMsg -match 'waiting for your input') {
+        "$(Get-Date -Format o) SKIP_IDLE" | Out-File -Append $logFile
         exit 0
     }
 
-    # 终端在前台 → 不弹
-    $fg = [CliToast.Win32]::GetForegroundWindow()
-    if (-not $Force -and $fg -eq $info.Hwnd) {
-        "$(Get-Date -Format o) FOCUSED case=$($info.Case) target=$($info.Hwnd)" | Out-File -Append $logFile
-        exit 0
+    # Warp 走自己的会话 URL：Warp 的伪控制台窗口没有 owner，hwnd 路线只能拿到一个不可见窗口，
+    # SetForegroundWindow 会「成功」但界面不动。WARP_FOCUS_URL 由 Warp shell 注入并被 hook 继承。
+    $warpUri = $env:WARP_FOCUS_URL
+
+    if ($warpUri) {
+        # Warp 窗口标题实时跟随当前标签页，与本会话控制台标题一致即说明你正看着这个标签页 → 不弹。
+        # （warp.sqlite 的 active_tab_index 只在特定时刻落盘，切标签页不写，不能用）
+        # 拿不到本会话标题时按「不在当前标签页」处理：宁可多弹一次，也不吞掉通知。
+        $term = Get-TerminalInfo
+        $sessionTitle = if ($term) { $term.Title } else { '' }
+        $fgWindow = Get-ForegroundWindowInfo
+        if (-not $Force -and $fgWindow.Process -eq 'warp' -and (Test-SameTitle $fgWindow.Title $sessionTitle)) {
+            "$(Get-Date -Format o) FOCUSED event=$hookEvent route=warp title=[$sessionTitle]" | Out-File -Append $logFile
+            exit 0
+        }
+        $launchUri = $warpUri
+        $taskTitle = Clean-TaskTitle -Raw $sessionTitle
+        $route = 'warp'
+    } else {
+        $info = Get-TerminalInfo
+        if (-not $info -or $info.Hwnd -eq [IntPtr]::Zero) {
+            "$(Get-Date -Format o) NO_TERMINAL" | Out-File -Append $logFile
+            exit 0
+        }
+
+        # 终端在前台 → 不弹
+        $fg = [CliToast.Win32]::GetForegroundWindow()
+        if (-not $Force -and $fg -eq $info.Hwnd) {
+            "$(Get-Date -Format o) FOCUSED case=$($info.Case) target=$($info.Hwnd)" | Out-File -Append $logFile
+            exit 0
+        }
+        $launchUri = "claudetofocus://focus?hwnd=$($info.Hwnd)"
+        $taskTitle = Clean-TaskTitle -Raw $info.Title
+        $route = "hwnd case=$($info.Case) target=$($info.Hwnd)"
     }
 
     # 内容优先级：Claude 最后回复 > 任务标题 > 项目名 > 兜底
     $msg = Clean-Message -Raw $lastMsg
-    $taskTitle = Clean-TaskTitle -Raw $info.Title
     if ($msg) {
         $body = if ($projectName) { "$projectName · $msg" } else { $msg }
     } elseif ($taskTitle) {
@@ -163,8 +238,8 @@ try {
         $body = '任务完成'
     }
 
-    Show-ClaudeToast -Title 'Claude Code' -Body $body -TargetHwnd $info.Hwnd
-    "$(Get-Date -Format o) FIRED case=$($info.Case) target=$($info.Hwnd) project=[$projectName] body=[$body]" | Out-File -Append $logFile
+    Show-ClaudeToast -Title 'Claude Code' -Body $body -LaunchUri $launchUri
+    "$(Get-Date -Format o) FIRED event=$hookEvent route=$route project=[$projectName] body=[$body]" | Out-File -Append $logFile
 } catch {
     "$(Get-Date -Format o) ERROR: $_" | Out-File -Append $logFile
     # 静默失败，不影响 Claude Code 主流程；设 CLAUDE_TOAST_DEBUG=1 时暴露错误便于排查

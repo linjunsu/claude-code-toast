@@ -7,7 +7,7 @@
       -PowerShell 5（默认）：hook 命令用 powershell（Windows PowerShell 5.1，系统自带），
                           BurntToast 若 PS5.1 看不到会自动复制一份给它。
     把本仓库放到任意目录后运行本脚本即可完成大半配置；
-    最后一步把 Stop hook 加进 ~/.claude/settings.json（见 README「AI 一键配置」或本脚本末尾输出）。
+    最后一步把 Stop 与 Notification 两个 hook 加进 ~/.claude/settings.json（见 README「AI 一键配置」或本脚本末尾输出）。
 #>
 [CmdletBinding()]
 param(
@@ -59,20 +59,26 @@ if (-not $usePwsh) {
 Write-Host "BurntToast 就绪（hook 将使用: $hookCommand）"
 
 Write-Host "=== [3/3] 配置 ~/.claude/settings.json ==="
-Write-Host "在 settings.json 顶层加以下内容（已有 hooks 就合并 Stop 键，路径改为上面的绝对路径）："
+Write-Host "在 settings.json 顶层加以下内容（已有 hooks 就合并 Stop、Notification 两个键，路径改为上面的绝对路径）："
 Write-Host ""
+$entry = @(
+    '      {'
+    '        "hooks": ['
+    '          {'
+    '            "type": "command",'
+    "            `"command`": `"$hookCommand`","
+    "            `"args`": [`"-NoProfile`", `"-ExecutionPolicy`", `"Bypass`", `"-File`", `"$toast`"],"
+    '            "timeout": 15'
+    '          }'
+    '        ]'
+    '      }'
+)
 Write-Host '  "hooks": {'
 Write-Host '    "Stop": ['
-Write-Host '      {'
-Write-Host '        "hooks": ['
-Write-Host '          {'
-Write-Host '            "type": "command",'
-Write-Host "            `"command`": `"$hookCommand`","
-Write-Host "            `"args`": [`"-NoProfile`", `"-ExecutionPolicy`", `"Bypass`", `"-File`", `"$toast`"],"
-Write-Host '            "timeout": 15'
-Write-Host '          }'
-Write-Host '        ]'
-Write-Host '      }'
+$entry | ForEach-Object { Write-Host $_ }
+Write-Host '    ],'
+Write-Host '    "Notification": ['
+$entry | ForEach-Object { Write-Host $_ }
 Write-Host '    ]'
 Write-Host '  }'
 Write-Host ""
