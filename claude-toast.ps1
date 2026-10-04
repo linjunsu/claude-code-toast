@@ -4,10 +4,12 @@
 .DESCRIPTION
     由 ~/.claude/settings.json 的 hook 调用：Stop（每次回应结束）与 Notification（Claude 要你做选择）。
     Notification 的 idle_prompt（闲置提醒）与 Stop 重复，只记日志不弹。
-    终端处于前台时不弹，避免打扰；Warp 下再比对窗口标题，只有你正看着本会话那个标签页才静默。
+    终端处于前台时不弹，避免打扰；Warp 下再比对窗口标题，只有你正看着本会话那个标签页才静默；
+    Pebrel 下问它的 Runtime，只有你正看着本会话那个窗格才静默。
     内容动态：项目名（cwd）+ Claude 最后一条回复（last_assistant_message）；
-    拿不到回复时退化为当前任务标题（控制台标题）。
-    回终端分两条路线：
+    拿不到回复时退化为当前任务标题（控制台标题 / Pebrel 窗格标题）。
+    回终端分三条路线：
+      · Pebrel：协议带上 PEBREL_PANE_ID，focus.ps1 用 `pebrel ctl focus --pane` 切到该窗格再拉窗口到前台。
       · Warp：用 Warp 注入的 WARP_FOCUS_URL（warp://session/<uuid>）直接激活，精确到标签页。
       · 其它终端（Windows Terminal 等）：hook 进程自带隐藏控制台 → 先 FreeConsole，
         再向上逐个祖先 AttachConsole，首个成功者即本会话 shell，其控制台窗口的 owner
@@ -208,6 +210,40 @@ function Get-TerminalInfo {
     return $null
 }
 
+# Pebrel：问它的 Runtime 本会话窗格的状态。
+# 「你正看着」= 窗口在前台 + 窗格所在标签页激活 + 焦点就在这个窗格（与 Pebrel 自己的通知判断一致）。
+# 输出含中文标题，用 ProcessStartInfo 指定 UTF-8 读，不受控制台代码页影响。
+function Get-PebrelPaneState {
+    param([string]$PaneId)
+    $cli = $env:PEBREL_CLI
+    if (-not $cli -or -not (Test-Path $cli)) { $cli = (Get-Command pebrel -ErrorAction SilentlyContinue).Source }
+    if (-not $cli) { return $null }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $cli
+    $psi.Arguments = 'ctl snapshot --timeout-ms 3000'
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $out = $p.StandardOutput.ReadToEnd()
+    $p.WaitForExit(5000) | Out-Null
+    $snap = $out | ConvertFrom-Json
+    if (-not $snap.ok) { return $null }
+
+    foreach ($w in $snap.result.windows) {
+        foreach ($t in $w.tabs) {
+            foreach ($pane in $t.panes) {
+                if ([string]$pane.id -ne $PaneId) { continue }
+                $visible = [bool]$w.focused -and [bool]$t.active -and ([string]$t.focused_pane_id -eq $PaneId)
+                return @{ Visible = $visible; Title = [string]$pane.title }
+            }
+        }
+    }
+    return $null
+}
+
 # 弹 toast：BurntToast 显示 + 「回到终端」按钮走协议激活回到终端
 function Show-ClaudeToast {
     param([string]$Title, [string]$Body, [string]$LaunchUri)
@@ -244,8 +280,23 @@ try {
     # Warp 走自己的会话 URL：Warp 的伪控制台窗口没有 owner，hwnd 路线只能拿到一个不可见窗口，
     # SetForegroundWindow 会「成功」但界面不动。WARP_FOCUS_URL 由 Warp shell 注入并被 hook 继承。
     $warpUri = $env:WARP_FOCUS_URL
+    # Pebrel 同样是无 owner 的伪控制台窗口，且窗口标题恒为「Pebrel」不随标签页变，
+    # hwnd 和比标题两条路都不通 → 改问 Pebrel 自己。放在 Warp 之前：从 Warp 里启动的 Pebrel 会继承 WARP_FOCUS_URL。
+    $pebrelPane = $env:PEBREL_PANE_ID
 
-    if ($warpUri) {
+    if ($env:TERM_PROGRAM -eq 'pebrel' -and $pebrelPane) {
+        # 查询失败按「没在看」处理：宁可多弹一次，也不吞掉通知。
+        $pane = $null
+        try { $pane = Get-PebrelPaneState -PaneId $pebrelPane } catch { }
+        if (-not $Force -and $pane -and $pane.Visible) {
+            "$(Get-Date -Format o) FOCUSED event=$hookEvent route=pebrel pane=$pebrelPane" | Out-File -Append $logFile
+            exit 0
+        }
+        # pid 用来在点击时找到 Pebrel 主窗口和它的 exe（exe 本身就是 CLI）
+        $launchUri = "claudetofocus://focus?pebrel_pane=$pebrelPane&pebrel_pid=$env:PEBREL_PROCESS_ID"
+        $taskTitle = if ($pane) { Clean-TaskTitle -Raw $pane.Title } else { '' }
+        $route = "pebrel pane=$pebrelPane"
+    } elseif ($warpUri) {
         # Warp 窗口标题实时跟随当前标签页，与本会话控制台标题一致即说明你正看着这个标签页 → 不弹。
         # （warp.sqlite 的 active_tab_index 只在特定时刻落盘，切标签页不写，不能用）
         # 拿不到本会话标题时按「不在当前标签页」处理：宁可多弹一次，也不吞掉通知。
