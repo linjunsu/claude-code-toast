@@ -6,7 +6,7 @@ Claude Code **每次回应结束**、以及**需要你做选择时**（批准命
 
 - **标题**：Claude Code
 - **正文**：`<项目名> · <Claude 最后一条回复摘要>`；要你做选择时是 `<项目名> · 需要授权：<工具> — <做什么>`，例如 `workbench · 需要授权：PowerShell — 重启开发服务器`
-- **按钮**：「回到终端」——点击精确切回承载该会话的终端窗口（多窗口多会话不混淆）；Warp 下还能切回该会话所在的标签页
+- **按钮**：「回到终端」——点击精确切回承载该会话的终端窗口（多窗口多会话不混淆）；Warp 下还能切回该会话所在的标签页，Pebrel 下精确到标签页里的分屏窗格
 
 行为复刻 GitHub Codex：**窗口不在这页才弹**；终端在前台时不打扰。
 
@@ -75,7 +75,7 @@ Claude Code **每次回应结束**、以及**需要你做选择时**（批准命
    > 用 PowerShell 5.1 的话，把 `"command": "pwsh"` 改成 `"command": "powershell"`。
 4. 重启 Claude Code（或开一次 `/hooks` 重载配置）。
 
-**依赖**：Windows 11、Windows Terminal 或 Warp、PowerShell 5.1 或 7、Claude Code。
+**依赖**：Windows 11、Windows Terminal / Warp / Pebrel、PowerShell 5.1 或 7、Claude Code。
 
 ## 选择 PowerShell 版本（5 / 7）
 
@@ -92,8 +92,9 @@ Claude Code **每次回应结束**、以及**需要你做选择时**（批准命
 - **内容优先级**：`Notification` 用待批工具（从 transcript 取）> 事件自带的 `message`；`Stop` 用 Claude 最后回复摘要 > 当前任务标题（控制台标题）> 项目名 > 兜底文案
 - **权限通知为什么要读 transcript**：`Notification` 的 `message` 恒为 `Claude needs your permission` 这一句死文案，不含工具名，光看通知没法判断该不该批。改为顺着 hook 给的 `transcript_path` 取会话记录尾部，最后一个还没有对应 `tool_result` 的 `tool_use` 就是卡在权限确认上的那个；`Bash`/`PowerShell` 取它的 `description`（拿不到退回命令首行），`Edit`/`Write`/`Read` 取文件名，`Grep`/`Glob` 取搜索模式，`WebFetch` 取 URL
 - **不重复打扰**：`Notification` 的 `idle_prompt`（闲置约 60 秒的「等你输入」提醒）与 `Stop` 那条内容重复，只记日志不弹
-- **前台判断**：终端窗口在前台时不弹。Warp 下改为比对标题——Warp 窗口标题实时跟随当前标签页，与本会话控制台标题一致才静默，所以**别的标签页跑完照样弹**
-- **回终端分两条路线**（按环境变量自动选，两边都不用配置）：
+- **前台判断**：终端窗口在前台时不弹。Warp 下改为比对标题——Warp 窗口标题实时跟随当前标签页，与本会话控制台标题一致才静默，所以**别的标签页跑完照样弹**。Pebrel 下问它的 Runtime（`pebrel ctl snapshot`）：窗口在前台、本窗格所在标签页激活、焦点就在本窗格，三者都满足才静默，所以**别的标签页、同标签页里别的分屏窗格跑完照样弹**
+- **回终端分三条路线**（按环境变量自动选，都不用配置）：
+  - **Pebrel**：hook 读 Pebrel 注入的 `PEBREL_PANE_ID` / `PEBREL_PROCESS_ID`，toast 走 `claudetofocus://focus?pebrel_pane=…` → `focus.ps1` 先调 `pebrel ctl focus --pane <id>` 让 Pebrel 切到该标签页并聚焦窗格，再用 `AttachThreadInput` 把 Pebrel 主窗口拉到前台（开了多个 Pebrel 窗口时，若 Pebrel 自己没能激活目标窗口，拉到前台的会是最近用过的那个窗口）
   - **Warp**：读 Warp 注入的 `WARP_FOCUS_URL`（`warp://session/<uuid>`），toast 直接用它做协议激活，由 Warp 自己切窗口 + 切标签页，不走寻窗和 `focus.ps1`
   - **Windows Terminal 等**：`FreeConsole` + 逐祖先 `AttachConsole` 精确寻窗（控制台窗口的 owner = 承载该会话的终端窗口，多窗口单进程也精确），toast 走 `claudetofocus://` 协议 → `focus.ps1` 用 `AttachThreadInput` 绕过 Windows 前台锁
 
@@ -116,7 +117,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
 - **Warp 下点了没反应**：Warp 的 `PseudoConsoleWindow` 不挂 owner（Windows Terminal 会挂），寻窗只能拿到那个不可见窗口，`SetForegroundWindow` 返回 True 但界面不动。所以 Warp 走 `WARP_FOCUS_URL` 而不是 hwnd。
 - **Warp 下怎么判断「你在看哪个标签页」**：`warp.sqlite` 里的 `windows.active_tab_index` 切标签页时**不落盘**（实测切换一分钟内数据库零写入），不可用；可用的是 Warp 窗口标题，它实时跟随当前标签页。局限：两个标签页的会话标题恰好相同时会误判为同一个而静默。
 - **不要同时装 Warp 官方的 [claude-code-warp](https://github.com/warpdotdev/claude-code-warp) 插件**，那套走 OSC 777 让 Warp 自己弹通知，和本项目重复，会收到两条。
-- **没弹窗排查**：看 `%TEMP%\claude-toast-actions.log`（记录 `NO_TERMINAL` / `FOCUSED` / `FIRED` / `ERROR`，`route=warp` / `route=hwnd` 标明走的哪条路线）。
+- **Pebrel 下为什么不走寻窗**：和 Warp 一样，Pebrel 的 `PseudoConsoleWindow` 不挂 owner，寻窗只能拿到那个不可见窗口——前台判断永远不命中（你看着也照弹），点按钮也没反应；而且 Pebrel 窗口标题恒为「Pebrel」，不随标签页变，Warp 那套比标题也用不了。所以改问 Pebrel 自己的 Runtime。
+- **Pebrel 会和本项目各弹一条**：Pebrel 自带系统通知（应用名「Pebrel」），窗格不在眼前时也会弹，只是 Claude 回合结束那条固定写「回合完成，等待下一条指令」，不带回复摘要和项目名。想只留本项目这条：Windows 设置 → 系统 → 通知 → 关掉「Pebrel」。代价是 Pebrel 系统通知里的「是 / 否」直接批准按钮、长命令跑完提醒也一起没了；Pebrel 窗口内的应用内提示不受影响。
+- **没弹窗排查**：看 `%TEMP%\claude-toast-actions.log`（记录 `NO_TERMINAL` / `FOCUSED` / `FIRED` / `ERROR`，`route=pebrel` / `route=warp` / `route=hwnd` 标明走的哪条路线）。
 
 ---
 
