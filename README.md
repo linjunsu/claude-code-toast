@@ -118,6 +118,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
 - **Warp 下怎么判断「你在看哪个标签页」**：`warp.sqlite` 里的 `windows.active_tab_index` 切标签页时**不落盘**（实测切换一分钟内数据库零写入），不可用；可用的是 Warp 窗口标题，它实时跟随当前标签页。局限：两个标签页的会话标题恰好相同时会误判为同一个而静默。
 - **不要同时装 Warp 官方的 [claude-code-warp](https://github.com/warpdotdev/claude-code-warp) 插件**，那套走 OSC 777 让 Warp 自己弹通知，和本项目重复，会收到两条。
 - **Pebrel 下为什么不走寻窗**：和 Warp 一样，Pebrel 的 `PseudoConsoleWindow` 不挂 owner，寻窗只能拿到那个不可见窗口——前台判断永远不命中（你看着也照弹），点按钮也没反应；而且 Pebrel 窗口标题恒为「Pebrel」，不随标签页变，Warp 那套比标题也用不了。所以改问 Pebrel 自己的 Runtime。
+- **`/bg` 后台会话也认得出 Pebrel**：后台会话跑在 Claude Code daemon 自建的伪控制台里，它会剥掉 `TERM_PROGRAM`，`PEBREL_*` 却原样继承。所以 `TERM_PROGRAM` 为空时凭 `PEBREL_PROCESS_ID` 认 Pebrel，否则会落到寻窗路线、拉起 daemon 那个不可见窗口，点了没反应。局限：点击回到的是当初执行 `/bg` 的那个窗格，之后在别的窗格重新接入后台会话的话认不出来。
 - **Pebrel 会和本项目各弹一条**：Pebrel 自带系统通知（应用名「Pebrel」），窗格不在眼前时也会弹，只是 Claude 回合结束那条固定写「回合完成，等待下一条指令」，不带回复摘要和项目名。想只留本项目这条：Windows 设置 → 系统 → 通知 → 关掉「Pebrel」。代价是 Pebrel 系统通知里的「是 / 否」直接批准按钮、长命令跑完提醒也一起没了；Pebrel 窗口内的应用内提示不受影响。
 - **没弹窗排查**：看 `%TEMP%\claude-toast-actions.log`（记录 `NO_TERMINAL` / `FOCUSED` / `FIRED` / `ERROR`，`route=pebrel` / `route=warp` / `route=hwnd` 标明走的哪条路线）。
 
