@@ -283,8 +283,12 @@ try {
     # Pebrel 同样是无 owner 的伪控制台窗口，且窗口标题恒为「Pebrel」不随标签页变，
     # hwnd 和比标题两条路都不通 → 改问 Pebrel 自己。放在 Warp 之前：从 Warp 里启动的 Pebrel 会继承 WARP_FOCUS_URL。
     $pebrelPane = $env:PEBREL_PANE_ID
+    # 后台会话（/bg，CLAUDE_CODE_SESSION_KIND=bg）跑在 Claude daemon 自建的伪控制台里，
+    # 它会剥掉 TERM_PROGRAM，PEBREL_* 却原样继承 → TERM_PROGRAM 为空时凭 PEBREL_PROCESS_ID 认 Pebrel。
+    # 不认的话会落到 hwnd 路线，拉起的是 daemon 那个不可见的伪控制台窗口，点了没反应。
+    $isPebrel = $pebrelPane -and ($env:TERM_PROGRAM -eq 'pebrel' -or (-not $env:TERM_PROGRAM -and $env:PEBREL_PROCESS_ID))
 
-    if ($env:TERM_PROGRAM -eq 'pebrel' -and $pebrelPane) {
+    if ($isPebrel) {
         # 查询失败按「没在看」处理：宁可多弹一次，也不吞掉通知。
         $pane = $null
         try { $pane = Get-PebrelPaneState -PaneId $pebrelPane } catch { }
