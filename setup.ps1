@@ -27,8 +27,22 @@ if (-not (Test-Path $vbs)) { throw "找不到 focus.vbs: $vbs" }
 if (-not (Test-Path $toast)) { throw "找不到 claude-toast.ps1: $toast" }
 
 Write-Host "=== [1/3] 注册 claudetofocus:// 协议 ==="
-$wscript = "$env:WINDIR\System32\wscript.exe"
-$handler = "`"$wscript`" `"$vbs`" `"%1`""
+# 优先用原生小程序 claude-toast-focus.exe：Pebrel 路线直连 Runtime API，点击到切窗格约 70ms（vbs 路线约 300ms）。
+# 没有现成 exe 但装了 Rust 就现编一个；都没有就退回 wscript + focus.vbs（功能一样，只是慢些）。
+$helper = Join-Path $dir 'claude-toast-focus.exe'
+$manifest = Join-Path $dir 'focus-helper\Cargo.toml'
+if (-not (Test-Path $helper) -and (Test-Path $manifest) -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Write-Host "编译 claude-toast-focus.exe ..."
+    cargo build --release --quiet --manifest-path $manifest
+    $built = Join-Path $dir 'focus-helper\target\release\claude-toast-focus.exe'
+    if (Test-Path $built) { Copy-Item $built $helper -Force }
+}
+if (Test-Path $helper) {
+    $handler = "`"$helper`" `"%1`""
+} else {
+    $wscript = "$env:WINDIR\System32\wscript.exe"
+    $handler = "`"$wscript`" `"$vbs`" `"%1`""
+}
 $schemeKey = 'HKCU:\Software\Classes\claudetofocus'
 New-Item -Path $schemeKey -Force | Out-Null
 Set-ItemProperty -Path $schemeKey -Name '(Default)' -Value 'URL: claudetofocus Protocol'
