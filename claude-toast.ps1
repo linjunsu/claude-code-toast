@@ -229,11 +229,40 @@ function Get-ClaudeSessionName {
     return ''
 }
 
-# 先按窗格 id 找；id 来自另一个 Pebrel 实例（重启过）或已不存在时，改按会话名比对窗格标题。
-# 后者是给 /bg 后台会话用的：它的 PEBREL_* 定格在当初 /bg 那一刻，之后在别的窗格 /resume 接回来，
-# 环境变量也不会更新，通知会指向一个早已关掉的窗格。
+# 这个前台会话最后一次 /resume 接上的后台会话短 id（8 位）。
+# 接上时 Claude 会在前台会话的 transcript 里写一行
+#   Opening "<名字>", running in the background (<短 id>)
+# 前台会话往往很小，大会话也只读末尾 256KB，开销可忽略。
+function Get-AttachedBgShortId {
+    param([string]$SessionId)
+    if (-not $SessionId) { return '' }
+    $root = Join-Path $env:USERPROFILE '.claude\projects'
+    foreach ($d in Get-ChildItem $root -Directory -ErrorAction SilentlyContinue) {
+        $f = Join-Path $d.FullName "$SessionId.jsonl"
+        if (-not (Test-Path $f)) { continue }
+        $fs = [System.IO.File]::Open($f, 'Open', 'Read', 'ReadWrite')
+        try {
+            $n = [Math]::Min($fs.Length, 262144)
+            $fs.Seek(-$n, 'End') | Out-Null
+            $buf = New-Object byte[] $n
+            $read = $fs.Read($buf, 0, $n)
+            $text = [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
+        } finally { $fs.Dispose() }
+        $m = [regex]::Matches($text, 'running in the background \(([0-9a-f]{8})\)')
+        if ($m.Count) { return $m[$m.Count - 1].Groups[1].Value }
+        return ''
+    }
+    return ''
+}
+
+# 找本会话所在的 Pebrel 窗格，三条线索：
+#   attached：哪个窗格的前台 Claude 用 /resume 接着本后台会话（只对 /bg 会话查）；
+#   env：PEBREL_PANE_ID，且 PEBREL_PROCESS_ID 就是当前这个 Pebrel；
+#   name：会话名与窗格标题整串相等。
+# 普通会话 env 最准；/bg 后台会话的 PEBREL_* 定格在 /bg 那一刻，Pebrel 重启或在别的窗格接回后都不更新，
+# 所以后台会话优先 attached，其次 env，最后才靠名字兜底。
 function Get-PebrelPaneState {
-    param([string]$PaneId, [string]$SessionName)
+    param([string]$PaneId, [string]$SessionName, [string]$SessionId, [switch]$Background)
     $cli = $env:PEBREL_CLI
     if (-not $cli -or -not (Test-Path $cli)) { $cli = (Get-Command pebrel -ErrorAction SilentlyContinue).Source }
     if (-not $cli) { return $null }
@@ -253,7 +282,8 @@ function Get-PebrelPaneState {
 
     $samePebrel = -not $env:PEBREL_PROCESS_ID -or ([string]$snap.result.process_id -eq $env:PEBREL_PROCESS_ID)
     $nameKey = Get-TitleKey -Raw $SessionName
-    $byName = $null
+    $shortId = if ($Background -and $SessionId.Length -ge 8) { $SessionId.Substring(0, 8) } else { '' }
+    $found = @{}
     foreach ($w in $snap.result.windows) {
         foreach ($t in $w.tabs) {
             foreach ($pane in $t.panes) {
@@ -262,14 +292,21 @@ function Get-PebrelPaneState {
                     Id = $id; Title = [string]$pane.title; ProcessId = [string]$snap.result.process_id
                     Visible = [bool]$w.focused -and [bool]$t.active -and ([string]$t.focused_pane_id -eq $id)
                 }
-                if ($samePebrel -and $id -eq $PaneId) { return $state }
+                if (-not $found.env -and $samePebrel -and $id -eq $PaneId) { $found.env = $state }
                 # 名字要整串相等：短名字（如项目名）前缀匹配容易撞到别的窗格
-                if (-not $byName -and $nameKey -and (Get-TitleKey -Raw $pane.title) -eq $nameKey) { $byName = $state }
+                if (-not $found.name -and $nameKey -and (Get-TitleKey -Raw $pane.title) -eq $nameKey) { $found.name = $state }
+                $paneSid = [string]$pane.agent.session_id
+                if (-not $found.attached -and $shortId -and $pane.agent.kind -eq 'claude' -and $paneSid -and $paneSid -ne $SessionId) {
+                    if ((Get-AttachedBgShortId -SessionId $paneSid) -eq $shortId) { $found.attached = $state }
+                }
             }
         }
     }
-    if ($byName) { $byName.ByName = $true }
-    return $byName
+    $order = if ($Background) { 'attached', 'env', 'name' } else { 'env', 'name' }
+    foreach ($k in $order) {
+        if ($found[$k]) { $found[$k].Via = $k; return $found[$k] }
+    }
+    return $null
 }
 
 # 弹 toast：BurntToast 显示 + 「回到终端」按钮走协议激活回到终端
@@ -321,9 +358,13 @@ try {
         $pane = $null
         $pebrelPid = $env:PEBREL_PROCESS_ID
         $paneNote = ''
-        try { $pane = Get-PebrelPaneState -PaneId $pebrelPane -SessionName (Get-ClaudeSessionName -SessionId $sessionId) } catch { }
+        $isBg = $env:CLAUDE_CODE_SESSION_KIND -eq 'bg'
+        try {
+            $pane = Get-PebrelPaneState -PaneId $pebrelPane -SessionId $sessionId -Background:$isBg `
+                -SessionName (Get-ClaudeSessionName -SessionId $sessionId)
+        } catch { }
         if ($pane) {
-            if ($pane.ByName) { $paneNote = " (env pane=$pebrelPane 已失效，按会话名找到)" }
+            if ($pane.Via -ne 'env') { $paneNote = " (env pane=$pebrelPane，按 $($pane.Via) 找到)" }
             $pebrelPane = $pane.Id
             $pebrelPid = $pane.ProcessId
         }
