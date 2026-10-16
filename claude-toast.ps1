@@ -30,6 +30,7 @@ $projectName = ''
 $lastMsg = ''
 $hookEvent = ''
 $transcriptPath = ''
+$sessionId = ''
 try {
     $inStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
@@ -42,6 +43,7 @@ try {
         if ($h.'hook_event_name') { $hookEvent = [string]$h.'hook_event_name' }
         if ($h.'last_assistant_message') { $lastMsg = [string]$h.'last_assistant_message' }
         if ($h.'transcript_path') { $transcriptPath = [string]$h.'transcript_path' }
+        if ($h.'session_id') { $sessionId = [string]$h.'session_id' }
         # Notification 的正文永远是「Claude needs your permission」这一句死文案，
         # 不含工具名，光看通知无法判断该不该批 → 待批工具从 transcript 里补。
         if ($h.message) { $lastMsg = [string]$h.message }
@@ -213,8 +215,25 @@ function Get-TerminalInfo {
 # Pebrel：问它的 Runtime 本会话窗格的状态。
 # 「你正看着」= 窗口在前台 + 窗格所在标签页激活 + 焦点就在这个窗格（与 Pebrel 自己的通知判断一致）。
 # 输出含中文标题，用 ProcessStartInfo 指定 UTF-8 读，不受控制台代码页影响。
+# 本会话的名字（/rename 或自动起的标题），从 ~/.claude/sessions/<pid>.json 按 session_id 找
+function Get-ClaudeSessionName {
+    param([string]$SessionId)
+    if (-not $SessionId) { return '' }
+    $dir = Join-Path $env:USERPROFILE '.claude\sessions'
+    foreach ($f in Get-ChildItem $dir -Filter *.json -ErrorAction SilentlyContinue) {
+        try {
+            $s = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($s.sessionId -eq $SessionId -and $s.name) { return [string]$s.name }
+        } catch { }
+    }
+    return ''
+}
+
+# 先按窗格 id 找；id 来自另一个 Pebrel 实例（重启过）或已不存在时，改按会话名比对窗格标题。
+# 后者是给 /bg 后台会话用的：它的 PEBREL_* 定格在当初 /bg 那一刻，之后在别的窗格 /resume 接回来，
+# 环境变量也不会更新，通知会指向一个早已关掉的窗格。
 function Get-PebrelPaneState {
-    param([string]$PaneId)
+    param([string]$PaneId, [string]$SessionName)
     $cli = $env:PEBREL_CLI
     if (-not $cli -or -not (Test-Path $cli)) { $cli = (Get-Command pebrel -ErrorAction SilentlyContinue).Source }
     if (-not $cli) { return $null }
@@ -232,16 +251,25 @@ function Get-PebrelPaneState {
     $snap = $out | ConvertFrom-Json
     if (-not $snap.ok) { return $null }
 
+    $samePebrel = -not $env:PEBREL_PROCESS_ID -or ([string]$snap.result.process_id -eq $env:PEBREL_PROCESS_ID)
+    $nameKey = Get-TitleKey -Raw $SessionName
+    $byName = $null
     foreach ($w in $snap.result.windows) {
         foreach ($t in $w.tabs) {
             foreach ($pane in $t.panes) {
-                if ([string]$pane.id -ne $PaneId) { continue }
-                $visible = [bool]$w.focused -and [bool]$t.active -and ([string]$t.focused_pane_id -eq $PaneId)
-                return @{ Visible = $visible; Title = [string]$pane.title }
+                $id = [string]$pane.id
+                $state = @{
+                    Id = $id; Title = [string]$pane.title; ProcessId = [string]$snap.result.process_id
+                    Visible = [bool]$w.focused -and [bool]$t.active -and ([string]$t.focused_pane_id -eq $id)
+                }
+                if ($samePebrel -and $id -eq $PaneId) { return $state }
+                # 名字要整串相等：短名字（如项目名）前缀匹配容易撞到别的窗格
+                if (-not $byName -and $nameKey -and (Get-TitleKey -Raw $pane.title) -eq $nameKey) { $byName = $state }
             }
         }
     }
-    return $null
+    if ($byName) { $byName.ByName = $true }
+    return $byName
 }
 
 # 弹 toast：BurntToast 显示 + 「回到终端」按钮走协议激活回到终端
@@ -291,15 +319,22 @@ try {
     if ($isPebrel) {
         # 查询失败按「没在看」处理：宁可多弹一次，也不吞掉通知。
         $pane = $null
-        try { $pane = Get-PebrelPaneState -PaneId $pebrelPane } catch { }
+        $pebrelPid = $env:PEBREL_PROCESS_ID
+        $paneNote = ''
+        try { $pane = Get-PebrelPaneState -PaneId $pebrelPane -SessionName (Get-ClaudeSessionName -SessionId $sessionId) } catch { }
+        if ($pane) {
+            if ($pane.ByName) { $paneNote = " (env pane=$pebrelPane 已失效，按会话名找到)" }
+            $pebrelPane = $pane.Id
+            $pebrelPid = $pane.ProcessId
+        }
         if (-not $Force -and $pane -and $pane.Visible) {
-            "$(Get-Date -Format o) FOCUSED event=$hookEvent route=pebrel pane=$pebrelPane" | Out-File -Append $logFile
+            "$(Get-Date -Format o) FOCUSED event=$hookEvent route=pebrel pane=$pebrelPane$paneNote" | Out-File -Append $logFile
             exit 0
         }
         # pid 用来在点击时找到 Pebrel 主窗口和它的 exe（exe 本身就是 CLI）
-        $launchUri = "claudetofocus://focus?pebrel_pane=$pebrelPane&pebrel_pid=$env:PEBREL_PROCESS_ID"
+        $launchUri = "claudetofocus://focus?pebrel_pane=$pebrelPane&pebrel_pid=$pebrelPid"
         $taskTitle = if ($pane) { Clean-TaskTitle -Raw $pane.Title } else { '' }
-        $route = "pebrel pane=$pebrelPane"
+        $route = "pebrel pane=$pebrelPane$paneNote"
     } elseif ($warpUri) {
         # Warp 窗口标题实时跟随当前标签页，与本会话控制台标题一致即说明你正看着这个标签页 → 不弹。
         # （warp.sqlite 的 active_tab_index 只在特定时刻落盘，切标签页不写，不能用）
