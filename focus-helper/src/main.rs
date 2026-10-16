@@ -3,7 +3,8 @@
 //! Pebrel 路线（`claudetofocus://focus?pebrel_pane=<id>&pebrel_pid=<pid>`）：
 //! 直接连 Pebrel 的 Runtime API（`%APPDATA%\Pebrel\runtime.port` 里的本机 TCP 端口 + 口令，
 //! 一行 JSON 一次请求）发 `window.focus`，不再经 wscript → pebrel.exe ctl 两次起进程。
-//! 切完若 Pebrel 没能把自己拉到前台，再用 AttachThreadInput 兜底。
+//! 请求一发出（不等回包）就同时把 Pebrel 窗口拉到前台：点击带来的前台权在本进程手里，
+//! Pebrel 自己激活常被前台锁拦下，等它回包再拉要多等约 100ms。回包后若仍不在前台再拉一次。
 //! 窗格不存在时退一步只聚焦窗口；Runtime 连不上就整条交回 focus.vbs（老路线）。
 //!
 //! 其他 URI（hwnd=…）原样交给同目录的 focus.vbs。
@@ -56,13 +57,22 @@ fn main() {
     let uri = std::env::args().nth(1).unwrap_or_default();
     if let Some(pane) = param(&uri, "pebrel_pane") {
         let t0 = Instant::now();
-        match pebrel_focus(&pane) {
+        let uri_pid: Option<u32> = param(&uri, "pebrel_pid").and_then(|p| p.parse().ok());
+        // 请求写出去就拉窗口（uri 里的 pid 可能是旧 Pebrel 的，找不到窗口就算了，回包后再补）
+        let mut early = String::from("-");
+        let mut on_sent = || {
+            if let Some(pid) = uri_pid {
+                let sent = t0.elapsed().as_millis();
+                let r = raise_process_window(pid);
+                early = format!("{r}@{sent}-{}ms", t0.elapsed().as_millis());
+            }
+        };
+        match pebrel_focus(&pane, &mut on_sent) {
             Ok((ok, pid)) => {
                 let ctl_ms = t0.elapsed().as_millis();
-                let pid = pid.or_else(|| param(&uri, "pebrel_pid").and_then(|p| p.parse().ok()));
-                let fg = pid.map(raise_process_window).unwrap_or("no-pid");
+                let fg = pid.or(uri_pid).map(raise_process_window).unwrap_or("no-pid");
                 let focus = if ok { "ok" } else { "pane-missing,window-only" };
-                log(&format!("helper pebrel pane={pane} focus={focus} ctl={ctl_ms}ms fg={fg}"));
+                log(&format!("helper pebrel pane={pane} focus={focus} ctl={ctl_ms}ms early={early} fg={fg}"));
                 return;
             }
             Err(e) => log(&format!("helper pebrel pane={pane} ERROR: {e} -> focus.vbs")),
@@ -80,7 +90,7 @@ fn param(uri: &str, key: &str) -> Option<String> {
 }
 
 /// 发 window.focus 到窗格；窗格不在了就只聚焦窗口。返回（窗格是否切成功，Pebrel pid）
-fn pebrel_focus(pane: &str) -> Result<(bool, Option<u32>), String> {
+fn pebrel_focus(pane: &str, on_sent: &mut dyn FnMut()) -> Result<(bool, Option<u32>), String> {
     let appdata = std::env::var("APPDATA").map_err(|_| "no APPDATA")?;
     let endpoint = std::fs::read_to_string(format!("{appdata}\\Pebrel\\runtime.port"))
         .map_err(|e| format!("runtime.port: {e}"))?;
@@ -88,15 +98,15 @@ fn pebrel_focus(pane: &str) -> Result<(bool, Option<u32>), String> {
     let port: u16 = parts.next().and_then(|p| p.parse().ok()).ok_or("bad port")?;
     let token = parts.next().ok_or("no token")?;
 
-    let resp = request(port, token, &format!("{{\"pane_id\":{pane}}}"))?;
+    let resp = request(port, token, &format!("{{\"pane_id\":{pane}}}"), on_sent)?;
     if is_ok(&resp) {
         return Ok((true, json_u32(&resp, "\"process_id\":")));
     }
-    let resp = request(port, token, "{}")?;
+    let resp = request(port, token, "{}", &mut || {})?;
     Ok((false, json_u32(&resp, "\"process_id\":")))
 }
 
-fn request(port: u16, token: &str, params: &str) -> Result<String, String> {
+fn request(port: u16, token: &str, params: &str, on_sent: &mut dyn FnMut()) -> Result<String, String> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))
         .map_err(|e| format!("connect: {e}"))?;
@@ -107,6 +117,7 @@ fn request(port: u16, token: &str, params: &str) -> Result<String, String> {
         std::process::id()
     );
     stream.write_all(line.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    on_sent();
     let mut resp = String::new();
     BufReader::new(stream).read_line(&mut resp).map_err(|e| format!("read: {e}"))?;
     // 口令不对时 Pebrel 直接断开，不回包
