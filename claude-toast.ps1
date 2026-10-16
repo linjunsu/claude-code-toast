@@ -272,12 +272,32 @@ function Get-PebrelPaneState {
     $psi.Arguments = 'ctl snapshot --timeout-ms 3000'
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $psi.CreateNoWindow = $true
-    $p = [System.Diagnostics.Process]::Start($psi)
-    $out = $p.StandardOutput.ReadToEnd()
-    $p.WaitForExit(5000) | Out-Null
-    $snap = $out | ConvertFrom-Json
+    # 后台会话的 endpoint 端口跟 runtime.port（当前实例）不一致，八成是 Pebrel 重启过：
+    # 直接不用它，省掉连死端口的超时（实测约 1.5 秒）。普通会话保留（隔离测试实例就靠它）。
+    if ($Background -and $env:PEBREL_RUNTIME_ENDPOINT) {
+        $portFile = Join-Path $env:APPDATA 'Pebrel\runtime.port'
+        $current = if (Test-Path $portFile) { ((Get-Content $portFile -Raw).Trim() -split '\s+')[0] } else { '' }
+        if ($current -and (($env:PEBREL_RUNTIME_ENDPOINT -split '\s+')[0] -ne $current)) {
+            $psi.EnvironmentVariables.Remove('PEBREL_RUNTIME_ENDPOINT')
+        }
+    }
+    $snap = $null
+    foreach ($attempt in 1, 2) {
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $errTask = $p.StandardError.ReadToEndAsync()
+        $out = $p.StandardOutput.ReadToEnd()
+        $p.WaitForExit(5000) | Out-Null
+        $null = $errTask.Result
+        try { $snap = $out | ConvertFrom-Json } catch { $snap = $null }
+        if ($snap.ok) { break }
+        # CLI 优先用 PEBREL_RUNTIME_ENDPOINT（端口+口令）。/bg 后台会话的这个变量还是当初那个 Pebrel 的，
+        # Pebrel 重启后它指向一个已关掉的端口 → 去掉它，让 CLI 按 runtime.port 找当前实例再问一次。
+        if (-not $psi.EnvironmentVariables.ContainsKey('PEBREL_RUNTIME_ENDPOINT')) { break }
+        $psi.EnvironmentVariables.Remove('PEBREL_RUNTIME_ENDPOINT')
+    }
     if (-not $snap.ok) { return $null }
 
     $samePebrel = -not $env:PEBREL_PROCESS_ID -or ([string]$snap.result.process_id -eq $env:PEBREL_PROCESS_ID)
