@@ -31,6 +31,8 @@ $lastMsg = ''
 $hookEvent = ''
 $transcriptPath = ''
 $sessionId = ''
+$agentId = ''
+$agentType = ''
 try {
     $inStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
@@ -44,6 +46,9 @@ try {
         if ($h.'last_assistant_message') { $lastMsg = [string]$h.'last_assistant_message' }
         if ($h.'transcript_path') { $transcriptPath = [string]$h.'transcript_path' }
         if ($h.'session_id') { $sessionId = [string]$h.'session_id' }
+        # 子 Agent 里触发的 hook 会多带 agent_id / agent_type；子 Agent 的 transcript 也落在 .../subagents/ 下
+        if ($h.'agent_id') { $agentId = [string]$h.'agent_id'; $agentType = [string]$h.'agent_type' }
+        elseif ($transcriptPath -match '[\\/]subagents[\\/]') { $agentId = 'transcript:subagents' }
         # Notification 的正文永远是「Claude needs your permission」这一句死文案，
         # 不含工具名，光看通知无法判断该不该批 → 待批工具从 transcript 里补。
         if ($h.message) { $lastMsg = [string]$h.message }
@@ -355,6 +360,12 @@ function Show-ClaudeToast {
 }
 
 try {
+    # 只给主会话弹：子 Agent 里触发的 Stop / Notification 一律静默（-Force 测试时放行）
+    if ($agentId -and -not $Force) {
+        "$(Get-Date -Format o) SKIP_SUBAGENT event=$hookEvent agent_id=$agentId type=[$agentType]" | Out-File -Append $logFile
+        exit 0
+    }
+
     # Notification 的 idle_prompt（「Claude is waiting for your input」，闲置约 60 秒触发）
     # 与本次回应结束时的 Stop 通知内容重复，只记日志不弹；permission_prompt 照弹。
     if ($hookEvent -eq 'Notification' -and $lastMsg -match 'waiting for your input') {
