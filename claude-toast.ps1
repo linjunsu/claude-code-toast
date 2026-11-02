@@ -2,8 +2,11 @@
 .SYNOPSIS
     Claude Code hook：任务完成时在右下角弹 Windows 原生 toast，点击「回到终端」按钮回到对应终端。
 .DESCRIPTION
-    由 ~/.claude/settings.json 的 hook 调用：Stop（每次回应结束）与 Notification（Claude 要你做选择）。
-    Notification 的 idle_prompt（闲置提醒）与 Stop 重复，只记日志不弹。
+    由 ~/.claude/settings.json 的 hook 调用：Stop（每次回应结束）、PermissionRequest（授权框出现）
+    与 Notification（Claude 要你做选择）。
+    Notification 的 idle_prompt（闲置提醒）与 Stop 重复，只记日志不弹；
+    Notification 的 permission_prompt 比授权框晚 7~19 秒，PermissionRequest 已弹过的就跳过。
+    AskUserQuestion 的授权通知直接显示问题本身。
     终端处于前台时不弹，避免打扰；Warp 下再比对窗口标题，只有你正看着本会话那个标签页才静默；
     Pebrel 下问它的 Runtime，只有你正看着本会话那个窗格才静默。
     内容动态：项目名（cwd）+ Claude 最后一条回复（last_assistant_message）；
@@ -33,6 +36,8 @@ $transcriptPath = ''
 $sessionId = ''
 $agentId = ''
 $agentType = ''
+$toolName = ''
+$toolInput = $null
 try {
     $inStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
@@ -52,8 +57,16 @@ try {
         # Notification 的正文永远是「Claude needs your permission」这一句死文案，
         # 不含工具名，光看通知无法判断该不该批 → 待批工具从 transcript 里补。
         if ($h.message) { $lastMsg = [string]$h.message }
+        # PermissionRequest 直接带待批工具，不用翻 transcript
+        if ($h.'tool_name') { $toolName = [string]$h.'tool_name'; $toolInput = $h.'tool_input' }
     }
 } catch { }
+
+# 授权通知有两条：PermissionRequest 在授权框出现的同一刻触发；
+# Notification(permission_prompt) 由 Claude Code 延迟数秒~十几秒才发。
+# 前者弹过就留个标记，后者见到标记就不再重复弹。
+$isPermNotif = $hookEvent -eq 'Notification' -and $lastMsg -match 'permission'
+$permMark = if ($sessionId) { Join-Path $env:TEMP "claude-toast-perm\$sessionId" } else { '' }
 
 # 标题归一化：去开头的加载动画字符、压缩空白
 function Get-TitleKey {
@@ -119,10 +132,28 @@ function Get-PendingTool {
     # 已经有结果 = 早就执行完了，不是本次要批的
     if ($lastUse.id -and $resultIds.Contains([string]$lastUse.id)) { return $null }
 
-    $name = [string]$lastUse.name
-    $in = $lastUse.input
+    return @{ Name = [string]$lastUse.name; Input = $lastUse.input }
+}
+
+# 待批工具 → 通知正文。PermissionRequest（stdin 直接给 tool_name/tool_input）
+# 与 Notification（从 transcript 补）共用。
+function Format-PermissionMessage {
+    param([string]$Name, $In)
+    if (-not $Name) { return '' }
+
+    # AskUserQuestion：直接把问题本身放进正文，比工具名有用得多
+    if ($Name -eq 'AskUserQuestion' -and $In.questions) {
+        $qs = @($In.questions)
+        $q = [string]$qs[0].question
+        if ($q) {
+            if ($qs.Count -gt 1) { $q = "$q（共 $($qs.Count) 题）" }
+            return Clean-Message -Raw "要你选：$q"
+        }
+    }
+
+    $in = $In
     $detail = ''
-    switch -Regex ($name) {
+    switch -Regex ($Name) {
         '^(Bash|PowerShell)$' {
             # description 是给人看的一句话摘要，比原始命令好读；没有再退回命令首行
             if ($in.description) { $detail = [string]$in.description }
@@ -139,7 +170,8 @@ function Get-PendingTool {
             elseif ($in.command) { $detail = ([string]$in.command -split "`n")[0] }
         }
     }
-    return @{ Name = $name; Detail = $detail }
+    $msg = if ($detail) { "需要授权：$Name — $detail" } else { "需要授权：$Name" }
+    return Clean-Message -Raw $msg
 }
 
 # Win32 声明：寻窗与前台判断共用
@@ -373,6 +405,17 @@ try {
         exit 0
     }
 
+    # 同一授权 PermissionRequest 已经弹过 → 迟到的 Notification 不再弹。
+    # 标记只在真弹出时写；当时你正看着窗格（FOCUSED）就没有标记，迟到的这条照常判断。
+    if ($isPermNotif -and $permMark -and (Test-Path $permMark)) {
+        $age = (Get-Date) - (Get-Item $permMark).LastWriteTime
+        Remove-Item $permMark -Force -ErrorAction SilentlyContinue
+        if ($age.TotalMinutes -lt 10) {
+            "$(Get-Date -Format o) SKIP_DUP_PERM age=$([int]$age.TotalSeconds)s" | Out-File -Append $logFile
+            exit 0
+        }
+    }
+
     # Warp 走自己的会话 URL：Warp 的伪控制台窗口没有 owner，hwnd 路线只能拿到一个不可见窗口，
     # SetForegroundWindow 会「成功」但界面不动。WARP_FOCUS_URL 由 Warp shell 注入并被 hook 继承。
     $warpUri = $env:WARP_FOCUS_URL
@@ -441,13 +484,11 @@ try {
 
     # 权限请求：把死文案换成「需要授权：<工具> — <做什么>」，通知里就能判断该不该批
     $msg = ''
-    if ($hookEvent -eq 'Notification' -and $lastMsg -match 'permission') {
+    if ($hookEvent -eq 'PermissionRequest') {
+        $msg = Format-PermissionMessage -Name $toolName -In $toolInput
+    } elseif ($isPermNotif) {
         $pending = Get-PendingTool -Path $transcriptPath
-        if ($pending) {
-            $msg = if ($pending.Detail) { "需要授权：$($pending.Name) — $($pending.Detail)" }
-                   else                 { "需要授权：$($pending.Name)" }
-            $msg = Clean-Message -Raw $msg
-        }
+        if ($pending) { $msg = Format-PermissionMessage -Name $pending.Name -In $pending.Input }
     }
 
     # 内容优先级：待批工具 > Claude 最后回复 > 任务标题 > 项目名 > 兜底
@@ -463,6 +504,11 @@ try {
     }
 
     Show-ClaudeToast -Title 'Claude Code' -Body $body -LaunchUri $launchUri
+    # 记下「这次授权已经弹过」，供稍后那条迟到的授权 Notification 去重
+    if ($hookEvent -eq 'PermissionRequest' -and $permMark) {
+        New-Item -ItemType Directory -Force (Split-Path $permMark) | Out-Null
+        Set-Content -Path $permMark -Value $toolName -Encoding UTF8
+    }
     "$(Get-Date -Format o) FIRED event=$hookEvent route=$route project=[$projectName] body=[$body]" | Out-File -Append $logFile
 } catch {
     "$(Get-Date -Format o) ERROR: $_" | Out-File -Append $logFile
