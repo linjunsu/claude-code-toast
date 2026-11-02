@@ -22,8 +22,6 @@ extern "system" {
     fn GetForegroundWindow() -> Hwnd;
     fn SetForegroundWindow(hwnd: Hwnd) -> i32;
     fn BringWindowToTop(hwnd: Hwnd) -> i32;
-    fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
-    fn IsIconic(hwnd: Hwnd) -> i32;
     fn IsWindowVisible(hwnd: Hwnd) -> i32;
     fn GetWindow(hwnd: Hwnd, cmd: u32) -> Hwnd;
     fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
@@ -51,7 +49,6 @@ struct SystemTime {
 }
 
 const GW_OWNER: u32 = 4;
-const SW_RESTORE: i32 = 9;
 
 fn main() {
     let uri = std::env::args().nth(1).unwrap_or_default();
@@ -163,9 +160,10 @@ fn raise_process_window(pid: u32) -> &'static str {
         return "no-window";
     }
     unsafe {
-        if IsIconic(hwnd) != 0 {
-            ShowWindow(hwnd, SW_RESTORE);
-        }
+        // 最小化的窗口这里不还原，交给 Pebrel 自己：它收到 window.focus 后，GPUI 的 activate
+        // 会异步 `IsIconic → ShowWindowAsync(SW_RESTORE)`。若这里先把窗口还原/最大化，
+        // 那条已排队的 SW_RESTORE 落在已最大化的窗口上，就成了「还原成普通大小」，最大化丢失。
+        // （2026-11-02 实测：这里 SW_RESTORE 或 SW_SHOWMAXIMIZED 都会被它冲掉；只抢前台则不会。）
         let fg = GetForegroundWindow();
         if fg == hwnd {
             return "already";
