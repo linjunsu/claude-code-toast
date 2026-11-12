@@ -19,6 +19,9 @@
         就是承载本会话的终端真实窗口（多窗口单进程下也精确）。
     toast 用 BurntToast 显示（手写 WinRT XML 在本机渲染为空，故弃用），
     「回到终端」按钮用协议激活跳转到上述 URI。
+    也给 Antigravity CLI（agy）用：~/.gemini/config/hooks.json 的 Stop 与 PreToolUse(ask_question)
+    调同一个脚本。agy 的输入是驼峰字段（conversationId 等），回复正文从它的 transcript.jsonl 里翻；
+    标题、图标、通知标识换成 Antigravity 的；stdout 按 agy 要求回 {"decision": ...}。
     -Force：测试用，无视前台判断直接弹。
     每次触发写入 %TEMP%\claude-toast-actions.log 便于排查。
 #>
@@ -38,6 +41,7 @@ $agentId = ''
 $agentType = ''
 $toolName = ''
 $toolInput = $null
+$source = 'claude'   # 'claude' = Claude Code；'agy' = Antigravity CLI
 try {
     $inStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
@@ -59,6 +63,27 @@ try {
         if ($h.message) { $lastMsg = [string]$h.message }
         # PermissionRequest 直接带待批工具，不用翻 transcript
         if ($h.'tool_name') { $toolName = [string]$h.'tool_name'; $toolInput = $h.'tool_input' }
+
+        # Antigravity CLI（agy）的 hook：字段是驼峰（conversationId / workspacePaths / transcriptPath），
+        # 由 ~/.gemini/config/hooks.json 的 Stop 与 PreToolUse(ask_question) 调用
+        if ($h.conversationId) {
+            $source = 'agy'
+            $sessionId = [string]$h.conversationId
+            $paths = @($h.workspacePaths)
+            if ($paths.Count -and $paths[0]) { $projectName = Split-Path -Leaf ([string]$paths[0]) }
+            if ($h.transcriptPath) { $transcriptPath = ([string]$h.transcriptPath) -replace '^~', $env:USERPROFILE }
+            if ($h.toolCall) {
+                $hookEvent = 'PreToolUse'
+                $toolName = [string]$h.toolCall.name
+                $toolInput = $h.toolCall.args
+            } else {
+                $hookEvent = 'Stop'
+                if ($h.terminationReason -eq 'error' -and $h.error) { $lastMsg = "出错了：$([string]$h.error)" }
+            }
+            # agy 要求 hook 在 stdout 回一个 decision：PreToolUse 放行，Stop 允许停下。
+            # 先回掉，后面不管弹不弹、哪条路退出都不影响 agy
+            if ($hookEvent -eq 'PreToolUse') { '{"decision":"allow"}' } else { '{"decision":"stop"}' }
+        }
     }
 } catch { }
 
@@ -98,7 +123,8 @@ function Clean-TaskTitle {
 function Clean-Message {
     param([string]$Raw)
     if (-not $Raw) { return '' }
-    $t = $Raw -replace '`{1,3}', ''
+    $t = $Raw -replace '\[([^\]]+)\]\([^)]*\)', '$1'   # Markdown 链接只留文字
+    $t = $t -replace '`{1,3}', ''
     $t = $t -replace '\*\*|__', ''
     $t = $t -replace '^#{1,6}\s*', ''
     $t = $t -replace '\s+', ' '
@@ -135,14 +161,27 @@ function Get-PendingTool {
     return @{ Name = [string]$lastUse.name; Input = $lastUse.input }
 }
 
+# agy 的最后一条回复：transcript.jsonl 里最后一条带 content、不带 tool_calls 的 PLANNER_RESPONSE。
+# agy 的 Stop hook 不像 Claude Code 那样直接给 last_assistant_message，只能自己翻。
+function Get-AgyLastReply {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path $Path)) { return '' }
+    $tail = Get-Content $Path -Tail 80 -Encoding UTF8 -ErrorAction SilentlyContinue
+    for ($i = $tail.Count - 1; $i -ge 0; $i--) {
+        try { $o = $tail[$i] | ConvertFrom-Json } catch { continue }
+        if ($o.type -eq 'PLANNER_RESPONSE' -and $o.content -and -not $o.tool_calls) { return [string]$o.content }
+    }
+    return ''
+}
+
 # 待批工具 → 通知正文。PermissionRequest（stdin 直接给 tool_name/tool_input）
 # 与 Notification（从 transcript 补）共用。
 function Format-PermissionMessage {
     param([string]$Name, $In)
     if (-not $Name) { return '' }
 
-    # AskUserQuestion：直接把问题本身放进正文，比工具名有用得多
-    if ($Name -eq 'AskUserQuestion' -and $In.questions) {
+    # AskUserQuestion（agy 叫 ask_question）：直接把问题本身放进正文，比工具名有用得多
+    if ($Name -in 'AskUserQuestion', 'ask_question' -and $In.questions) {
         $qs = @($In.questions)
         $q = [string]$qs[0].question
         if ($q) {
@@ -368,7 +407,7 @@ function Get-PebrelPaneState {
 
 # 弹 toast：BurntToast 显示 + 「回到终端」按钮走协议激活回到终端
 function Show-ClaudeToast {
-    param([string]$Title, [string]$Body, [string]$LaunchUri)
+    param([string]$Title, [string]$Body, [string]$LaunchUri, [string]$Logo = 'claude-logo.png', [string]$Id = 'claude-toast')
 
     Import-Module BurntToast -ErrorAction Stop
 
@@ -377,9 +416,9 @@ function Show-ClaudeToast {
     $text1 = New-BTText -Text $Title
     $text2 = New-BTText -Text $Body
 
-    # 应用 logo：用同目录的 claude-logo.png（Claude Code 图标）
+    # 应用 logo：同目录的 claude-logo.png（Claude Code）或 agy-logo.png（Antigravity）
     $bindingArgs = @{ Children = @($text1, $text2) }
-    $logo = Join-Path $PSScriptRoot 'claude-logo.png'
+    $logo = Join-Path $PSScriptRoot $Logo
     if (Test-Path $logo) {
         $bindingArgs['AppLogoOverride'] = New-BTImage -Source $logo -AppLogoOverride -Crop Circle
     }
@@ -388,7 +427,8 @@ function Show-ClaudeToast {
     $btn = New-BTButton -Content '回到终端' -ActivationType Protocol -Arguments $uri
     $action = New-BTAction -Buttons $btn
     $content = New-BTContent -Visual $visual -Actions $action -ActivationType Protocol -Launch $uri -Duration Long
-    Submit-BTNotification -Content $content -UniqueIdentifier 'claude-toast' | Out-Null
+    # 两边用不同的标识，agy 的通知不会顶掉 Claude Code 的
+    Submit-BTNotification -Content $content -UniqueIdentifier $Id | Out-Null
 }
 
 try {
@@ -484,8 +524,10 @@ try {
 
     # 权限请求：把死文案换成「需要授权：<工具> — <做什么>」，通知里就能判断该不该批
     $msg = ''
-    if ($hookEvent -eq 'PermissionRequest') {
+    if ($hookEvent -in 'PermissionRequest', 'PreToolUse') {
         $msg = Format-PermissionMessage -Name $toolName -In $toolInput
+    } elseif ($source -eq 'agy' -and -not $lastMsg) {
+        $lastMsg = Get-AgyLastReply -Path $transcriptPath
     } elseif ($isPermNotif) {
         $pending = Get-PendingTool -Path $transcriptPath
         if ($pending) { $msg = Format-PermissionMessage -Name $pending.Name -In $pending.Input }
@@ -503,13 +545,17 @@ try {
         $body = '任务完成'
     }
 
-    Show-ClaudeToast -Title 'Claude Code' -Body $body -LaunchUri $launchUri
+    if ($source -eq 'agy') {
+        Show-ClaudeToast -Title 'Antigravity' -Body $body -LaunchUri $launchUri -Logo 'agy-logo.png' -Id 'agy-toast'
+    } else {
+        Show-ClaudeToast -Title 'Claude Code' -Body $body -LaunchUri $launchUri
+    }
     # 记下「这次授权已经弹过」，供稍后那条迟到的授权 Notification 去重
     if ($hookEvent -eq 'PermissionRequest' -and $permMark) {
         New-Item -ItemType Directory -Force (Split-Path $permMark) | Out-Null
         Set-Content -Path $permMark -Value $toolName -Encoding UTF8
     }
-    "$(Get-Date -Format o) FIRED event=$hookEvent route=$route project=[$projectName] body=[$body]" | Out-File -Append $logFile
+    "$(Get-Date -Format o) FIRED src=$source event=$hookEvent route=$route project=[$projectName] body=[$body]" | Out-File -Append $logFile
 } catch {
     "$(Get-Date -Format o) ERROR: $_" | Out-File -Append $logFile
     # 静默失败，不影响 Claude Code 主流程；设 CLAUDE_TOAST_DEBUG=1 时暴露错误便于排查
